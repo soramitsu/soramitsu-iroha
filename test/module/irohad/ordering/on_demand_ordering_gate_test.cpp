@@ -131,9 +131,6 @@ TEST_F(OnDemandOrderingGateTest, BlockEvent) {
   EXPECT_CALL(*ordering_service, onCollaborationOutcome(round)).Times(1);
 
   OnDemandOrderingService::BatchesSetType transactions;
-  EXPECT_CALL(*ordering_service, forCachedBatches(_))
-      .WillOnce(InvokeArgument<0>(transactions));
-
   EXPECT_CALL(*notification, getRequestDelay())
       .WillOnce(Return(std::chrono::milliseconds(1)));
 
@@ -404,11 +401,6 @@ TEST_F(OnDemandOrderingGateTest, PopNonEmptyBatchesFromTheCache) {
   EXPECT_CALL(*ordering_service,
               waitForLocalProposal(round, std::chrono::milliseconds(1)))
       .WillOnce(Return(std::nullopt));
-  EXPECT_CALL(*ordering_service, forCachedBatches(_))
-      .WillOnce(InvokeArgument<0>(collection2));
-
-  EXPECT_CALL(*notification, onBatches(UnorderedElementsAreArray(collection)))
-      .Times(1);
 
   ordering_gate->processRoundSwitch(RoundSwitch(round, ledger_state));
 }
