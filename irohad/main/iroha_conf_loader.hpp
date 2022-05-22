@@ -73,6 +73,10 @@ struct IrohadConfig {
   std::optional<shared_model::interface::types::PeerList> initial_peers;
   boost::optional<UtilityService> utility_service;
 
+  // getters
+  uint32_t getProposalDelay() const;
+  uint32_t getProposalCreationTimeout() const;
+
   // This is a part of cryto providers feature:
   // https://github.com/MBoldyrev/iroha/tree/feature/hsm-utimaco.
   // This brings unnecessary complexity, but the aim is that this config section
