@@ -13,8 +13,9 @@ use super::Configuration;
 #[test]
 fn client_add_asset_quantity_to_existing_asset_should_increase_asset_amount_on_another_peer(
 ) -> Result<()> {
+    prepare_test_for_nextest!();
     // Given
-    let (_rt, network, mut iroha_client) = <Network>::start_test_with_runtime(4, 1);
+    let (_rt, network, iroha_client) = <Network>::start_test_with_runtime(4, 1);
     wait_for_genesis_committed(&network.clients(), 0);
     let pipeline_time = Configuration::pipeline_time();
 
@@ -23,8 +24,7 @@ fn client_add_asset_quantity_to_existing_asset_should_increase_asset_amount_on_a
     let (public_key, _) = KeyPair::generate()?.into();
     let create_account = RegisterBox::new(Account::new(account_id.clone(), [public_key]));
     let asset_definition_id = AssetDefinitionId::from_str("xor#domain")?;
-    let create_asset =
-        RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()).build());
+    let create_asset = RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()));
     iroha_client.submit_all(vec![
         create_domain.into(),
         create_account.into(),

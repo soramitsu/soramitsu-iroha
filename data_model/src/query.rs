@@ -3,10 +3,8 @@
 #![allow(clippy::missing_inline_in_public_items)]
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 
-#[cfg(feature = "std")]
-use iroha_crypto::prelude::*;
 use iroha_crypto::SignatureOf;
 use iroha_macro::FromVariant;
 use iroha_schema::prelude::*;
@@ -15,9 +13,12 @@ use parity_scale_codec::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
 use self::{
-    account::*, asset::*, domain::*, peer::*, permissions::*, role::*, transaction::*, trigger::*,
+    account::*, asset::*, block::*, domain::*, peer::*, permissions::*, role::*, transaction::*,
+    trigger::*,
 };
-use crate::{account::Account, pagination::Pagination, Identifiable, Value};
+use crate::{
+    account::Account, pagination::Pagination, predicate::PredicateBox, Identifiable, Value,
+};
 
 /// Sized container for all possible Queries.
 #[allow(clippy::enum_variant_names)]
@@ -26,14 +27,14 @@ use crate::{account::Account, pagination::Pagination, Identifiable, Value};
     Clone,
     PartialEq,
     Eq,
-    PartialOrd,
-    Ord,
     Decode,
     Encode,
     Deserialize,
     Serialize,
     FromVariant,
     IntoSchema,
+    PartialOrd,
+    Ord,
 )]
 pub enum QueryBox {
     /// [`FindAllAccounts`] variant.
@@ -54,6 +55,8 @@ pub enum QueryBox {
     FindAllAssetsDefinitions(FindAllAssetsDefinitions),
     /// [`FindAssetById`] variant.
     FindAssetById(FindAssetById),
+    /// [`FindAssetDefinitionById`] variant.
+    FindAssetDefinitionById(FindAssetDefinitionById),
     /// [`FindAssetsByName`] variant.
     FindAssetsByName(FindAssetsByName),
     /// [`FindAssetsByAccountId`] variant.
@@ -78,18 +81,24 @@ pub enum QueryBox {
     FindDomainKeyValueByIdAndKey(FindDomainKeyValueByIdAndKey),
     /// [`FindAllPeers`] variant.
     FindAllPeers(FindAllPeers),
+    /// [`FindAllBlocks`] variant.
+    FindAllBlocks(FindAllBlocks),
+    /// [`FindAllTransactions`] variant.
+    FindAllTransactions(FindAllTransactions),
     /// [`FindTransactionsByAccountId`] variant.
     FindTransactionsByAccountId(FindTransactionsByAccountId),
     /// [`FindTransactionByHash`] variant.
     FindTransactionByHash(FindTransactionByHash),
     /// [`FindPermissionTokensByAccountId`] variant.
     FindPermissionTokensByAccountId(FindPermissionTokensByAccountId),
-    /// [`FindAllActiveTriggers`] variant.
+    /// [`FindAllActiveTriggerIds`] variant.
     FindAllActiveTriggerIds(FindAllActiveTriggerIds),
     /// [`FindTriggerById`] variant.
     FindTriggerById(FindTriggerById),
     /// [`FindTriggerKeyValueByIdAndKey`] variant.
     FindTriggerKeyValueByIdAndKey(FindTriggerKeyValueByIdAndKey),
+    /// [`FindTriggersByDomainId`] variant.
+    FindTriggersByDomainId(FindTriggersByDomainId),
     /// [`FindAllRoles`] variant.
     FindAllRoles(FindAllRoles),
     /// [`FindAllRoleIds`] variant.
@@ -120,6 +129,8 @@ pub struct Payload {
     pub query: QueryBox,
     /// Account id of the user who will sign this query.
     pub account_id: <Account as Identifiable>::Id,
+    /// The filter applied to the result on the server-side.
+    pub filter: PredicateBox,
 }
 
 impl Payload {
@@ -162,10 +173,12 @@ declare_versioned_with_scale!(VersionedPaginatedQueryResult 1..2, Debug, Clone, 
 
 /// Paginated Query Result
 #[version_with_scale(n = 1, versioned = "VersionedPaginatedQueryResult")]
-#[derive(Debug, Clone, PartialEq, Eq, Decode, Encode, Deserialize, Serialize, IntoSchema)]
+#[derive(Debug, Clone, Decode, Encode, Deserialize, Serialize, IntoSchema)]
 pub struct PaginatedQueryResult {
     /// The result of the query execution.
     pub result: QueryResult,
+    /// The filter that was applied to the Query result. Returned as a sanity check, but also to ease debugging on the front-end.
+    pub filter: PredicateBox,
     /// pagination
     pub pagination: Pagination,
     /// Total query amount (if applicable) else 0.
@@ -175,13 +188,18 @@ pub struct PaginatedQueryResult {
 #[cfg(all(feature = "std", feature = "warp"))]
 impl QueryRequest {
     /// Constructs a new request with the `query`.
-    pub fn new(query: QueryBox, account_id: <Account as Identifiable>::Id) -> Self {
+    pub fn new(
+        query: QueryBox,
+        account_id: <Account as Identifiable>::Id,
+        filter: PredicateBox,
+    ) -> Self {
         let timestamp_ms = crate::current_time().as_millis();
         Self {
             payload: Payload {
                 timestamp_ms,
                 query,
                 account_id,
+                filter,
             },
         }
     }
@@ -190,7 +208,10 @@ impl QueryRequest {
     ///
     /// # Errors
     /// Fails if signature creation fails.
-    pub fn sign(self, key_pair: KeyPair) -> Result<SignedQueryRequest, iroha_crypto::Error> {
+    pub fn sign(
+        self,
+        key_pair: iroha_crypto::KeyPair,
+    ) -> Result<SignedQueryRequest, iroha_crypto::Error> {
         let signature = SignatureOf::new(key_pair, &self.payload)?;
         Ok(SignedQueryRequest {
             payload: self.payload,
@@ -219,13 +240,13 @@ pub mod role {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllRoles;
 
@@ -241,13 +262,13 @@ pub mod role {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllRoleIds;
 
@@ -255,19 +276,19 @@ pub mod role {
         type Output = Vec<<Role as Identifiable>::Id>;
     }
 
-    /// `FindRoleByRoleId` Iroha Query to find the [`Role`] which has the given [`Id`]
+    /// `FindRoleByRoleId` Iroha Query to find the [`Role`] which has the given [`Id`](crate::role::Id)
     #[derive(
         Debug,
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindRoleByRoleId {
         /// `Id` of the `Role` to find
@@ -284,13 +305,13 @@ pub mod role {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindRolesByAccountId {
         /// `Id` of an account to find.
@@ -299,6 +320,36 @@ pub mod role {
 
     impl Query for FindRolesByAccountId {
         type Output = Vec<<Role as Identifiable>::Id>;
+    }
+
+    impl FindAllRoles {
+        /// Construct [`FindAllRoles`].
+        pub const fn new() -> Self {
+            FindAllRoles
+        }
+    }
+
+    impl FindAllRoleIds {
+        /// Construct [`FindAllRoleIds`].
+        pub const fn new() -> Self {
+            FindAllRoleIds
+        }
+    }
+
+    impl FindRoleByRoleId {
+        /// Construct [`FindRoleByRoleId`].
+        pub fn new(id: impl Into<EvaluatesTo<<Role as Identifiable>::Id>>) -> Self {
+            let id = id.into();
+            FindRoleByRoleId { id }
+        }
+    }
+
+    impl FindRolesByAccountId {
+        /// Construct [`FindRolesByAccountId`].
+        pub fn new(account_id: impl Into<EvaluatesTo<<Account as Identifiable>::Id>>) -> Self {
+            let account_id = account_id.into();
+            FindRolesByAccountId { id: account_id }
+        }
     }
 
     /// The prelude re-exports most commonly used traits, structs and macros from this module.
@@ -325,13 +376,13 @@ pub mod permissions {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindPermissionTokensByAccountId {
         /// `Id` of an account to find.
@@ -369,13 +420,13 @@ pub mod account {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllAccounts;
 
@@ -389,13 +440,13 @@ pub mod account {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAccountById {
         /// `Id` of an account to find.
@@ -413,13 +464,13 @@ pub mod account {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAccountKeyValueByIdAndKey {
         /// `Id` of an account to find.
@@ -439,13 +490,13 @@ pub mod account {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAccountsByName {
         /// `name` of accounts to find.
@@ -463,13 +514,13 @@ pub mod account {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAccountsByDomainId {
         /// `Id` of the domain under which accounts should be found.
@@ -487,13 +538,13 @@ pub mod account {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAccountsWithAsset {
         /// `Id` of the definition of the asset which should be stored in founded accounts.
@@ -588,13 +639,13 @@ pub mod asset {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllAssets;
 
@@ -611,13 +662,13 @@ pub mod asset {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllAssetsDefinitions;
 
@@ -631,13 +682,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetById {
         /// `Id` of an `Asset` to find.
@@ -648,6 +699,29 @@ pub mod asset {
         type Output = Asset;
     }
 
+    /// `FindAssetDefinitionById` Iroha Query will find an `AssetDefinition` by it's identification in Iroha `Peer`.
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Decode,
+        Encode,
+        Deserialize,
+        Serialize,
+        IntoSchema,
+        PartialOrd,
+        Ord,
+    )]
+    pub struct FindAssetDefinitionById {
+        /// `Id` of an `AssetDefinition` to find.
+        pub id: EvaluatesTo<AssetDefinitionId>,
+    }
+
+    impl Query for FindAssetDefinitionById {
+        type Output = AssetDefinition;
+    }
+
     /// `FindAssetsByName` Iroha Query will get `Asset`s name as input and
     /// find all `Asset`s with it in Iroha `Peer`.
     #[derive(
@@ -655,13 +729,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetsByName {
         /// `Name` of `Asset`s to find.
@@ -679,13 +753,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetsByAccountId {
         /// `AccountId` under which assets should be found.
@@ -703,13 +777,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetsByAssetDefinitionId {
         /// `AssetDefinitionId` with type of `Asset`s should be found.
@@ -727,13 +801,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetsByDomainId {
         /// `Id` of the domain under which assets should be found.
@@ -752,13 +826,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetsByDomainIdAndAssetDefinitionId {
         /// `Id` of the domain under which assets should be found.
@@ -778,13 +852,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetQuantityById {
         /// `Id` of an `Asset` to find quantity of.
@@ -802,13 +876,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetKeyValueByIdAndKey {
         /// `Id` of an `Asset` acting as `Store`.
@@ -828,13 +902,13 @@ pub mod asset {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAssetDefinitionKeyValueByIdAndKey {
         /// `Id` of an `Asset` acting as `Store`.
@@ -864,6 +938,14 @@ pub mod asset {
     impl FindAssetById {
         /// Construct [`FindAssetById`].
         pub fn new(id: impl Into<EvaluatesTo<AssetId>>) -> Self {
+            let id = id.into();
+            Self { id }
+        }
+    }
+
+    impl FindAssetDefinitionById {
+        /// Construct [`FindAssetDefinitionById`].
+        pub fn new(id: impl Into<EvaluatesTo<AssetDefinitionId>>) -> Self {
             let id = id.into();
             Self { id }
         }
@@ -935,10 +1017,22 @@ pub mod asset {
         }
     }
 
+    impl FindAssetDefinitionKeyValueByIdAndKey {
+        /// Construct [`FindAssetDefinitionKeyValueByIdAndKey`].
+        pub fn new(
+            id: impl Into<EvaluatesTo<AssetDefinitionId>>,
+            key: impl Into<EvaluatesTo<Name>>,
+        ) -> Self {
+            let id = id.into();
+            let key = key.into();
+            Self { id, key }
+        }
+    }
+
     /// The prelude re-exports most commonly used traits, structs and macros from this crate.
     pub mod prelude {
         pub use super::{
-            FindAllAssets, FindAllAssetsDefinitions, FindAssetById,
+            FindAllAssets, FindAllAssetsDefinitions, FindAssetById, FindAssetDefinitionById,
             FindAssetDefinitionKeyValueByIdAndKey, FindAssetKeyValueByIdAndKey,
             FindAssetQuantityById, FindAssetsByAccountId, FindAssetsByAssetDefinitionId,
             FindAssetsByDomainId, FindAssetsByDomainIdAndAssetDefinitionId, FindAssetsByName,
@@ -968,13 +1062,13 @@ pub mod domain {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllDomains;
 
@@ -988,13 +1082,13 @@ pub mod domain {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindDomainById {
         /// `Id` of the domain to find.
@@ -1027,13 +1121,13 @@ pub mod domain {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindDomainKeyValueByIdAndKey {
         /// `Id` of an domain to find.
@@ -1085,13 +1179,13 @@ pub mod peer {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllPeers;
 
@@ -1107,13 +1201,13 @@ pub mod peer {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllParameters;
 
@@ -1151,7 +1245,8 @@ pub mod trigger {
 
     use super::Query;
     use crate::{
-        events::FilterBox, expression::EvaluatesTo, trigger::Trigger, Identifiable, Name, Value,
+        domain::prelude::*, events::FilterBox, expression::EvaluatesTo, trigger::Trigger,
+        Identifiable, Name, Value,
     };
 
     /// Find all currently active (as in not disabled and/or expired)
@@ -1163,13 +1258,13 @@ pub mod trigger {
         Default,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindAllActiveTriggerIds;
 
@@ -1183,13 +1278,13 @@ pub mod trigger {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindTriggerById {
         /// The Identification of the trigger to be found.
@@ -1205,13 +1300,13 @@ pub mod trigger {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     /// Find Trigger's metadata key-value pairs.
     pub struct FindTriggerKeyValueByIdAndKey {
@@ -1225,9 +1320,44 @@ pub mod trigger {
         type Output = Value;
     }
 
+    /// Find Triggers given domain ID.
+    #[derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Decode,
+        Encode,
+        Deserialize,
+        Serialize,
+        IntoSchema,
+        PartialOrd,
+        Ord,
+    )]
+    pub struct FindTriggersByDomainId {
+        /// `DomainId` under which triggers should be found.
+        pub domain_id: EvaluatesTo<DomainId>,
+    }
+
+    impl FindTriggersByDomainId {
+        /// Construct [`FindTriggersByDomainId`].
+        pub fn new(domain_id: impl Into<EvaluatesTo<DomainId>>) -> Self {
+            Self {
+                domain_id: domain_id.into(),
+            }
+        }
+    }
+
+    impl Query for FindTriggersByDomainId {
+        type Output = Vec<Trigger<FilterBox>>;
+    }
+
     pub mod prelude {
         //! Prelude Re-exports most commonly used traits, structs and macros from this crate.
-        pub use super::{FindAllActiveTriggerIds, FindTriggerById, FindTriggerKeyValueByIdAndKey};
+        pub use super::{
+            FindAllActiveTriggerIds, FindTriggerById, FindTriggerKeyValueByIdAndKey,
+            FindTriggersByDomainId,
+        };
     }
 }
 
@@ -1249,6 +1379,35 @@ pub mod transaction {
         account::prelude::AccountId, expression::EvaluatesTo, transaction::TransactionValue,
     };
 
+    #[derive(
+        Default,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Decode,
+        Encode,
+        Deserialize,
+        Serialize,
+        IntoSchema,
+        PartialOrd,
+        Ord,
+    )]
+    /// `FindAllTransactions` Iroha Query will list all transactions included in blockchain
+    pub struct FindAllTransactions;
+
+    impl Query for FindAllTransactions {
+        type Output = Vec<TransactionValue>;
+    }
+
+    impl FindAllTransactions {
+        /// Construct [`FindAllTransactions`].
+        pub fn new() -> Self {
+            Self {}
+        }
+    }
+
     /// `FindTransactionsByAccountId` Iroha Query will find all transaction included in blockchain
     /// for the account
     #[derive(
@@ -1256,13 +1415,13 @@ pub mod transaction {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindTransactionsByAccountId {
         /// Signer's `AccountId` under which transactions should be found.
@@ -1288,13 +1447,13 @@ pub mod transaction {
         Clone,
         PartialEq,
         Eq,
-        PartialOrd,
-        Ord,
         Decode,
         Encode,
         Deserialize,
         Serialize,
         IntoSchema,
+        PartialOrd,
+        Ord,
     )]
     pub struct FindTransactionByHash {
         /// Transaction hash.
@@ -1315,17 +1474,67 @@ pub mod transaction {
 
     /// The prelude re-exports most commonly used traits, structs and macros from this crate.
     pub mod prelude {
-        pub use super::{FindTransactionByHash, FindTransactionsByAccountId};
+        pub use super::{FindAllTransactions, FindTransactionByHash, FindTransactionsByAccountId};
+    }
+}
+
+pub mod block {
+    //! Queries related to `Transaction`.
+
+    #![allow(clippy::missing_inline_in_public_items)]
+
+    #[cfg(not(feature = "std"))]
+    use alloc::{format, string::String, vec::Vec};
+
+    use iroha_schema::prelude::*;
+    use parity_scale_codec::{Decode, Encode};
+    use serde::{Deserialize, Serialize};
+
+    use super::Query;
+    use crate::block_value::BlockValue;
+
+    #[derive(
+        Default,
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Decode,
+        Encode,
+        Deserialize,
+        Serialize,
+        IntoSchema,
+        PartialOrd,
+        Ord,
+    )]
+    /// `FindAllBlocks` Iroha Query will list all blocks
+    pub struct FindAllBlocks;
+
+    impl Query for FindAllBlocks {
+        type Output = Vec<BlockValue>;
+    }
+
+    impl FindAllBlocks {
+        /// Construct [`FindAllBlocks`].
+        pub fn new() -> Self {
+            Self {}
+        }
+    }
+
+    /// The prelude re-exports most commonly used traits, structs and macros from this crate.
+    pub mod prelude {
+        pub use super::FindAllBlocks;
     }
 }
 
 /// The prelude re-exports most commonly used traits, structs and macros from this crate.
 pub mod prelude {
     pub use super::{
-        account::prelude::*, asset::prelude::*, domain::prelude::*, peer::prelude::*,
-        permissions::prelude::*, role::prelude::*, transaction::*, trigger::prelude::*,
-        PaginatedQueryResult, Query, QueryBox, QueryResult, VersionedPaginatedQueryResult,
-        VersionedQueryResult,
+        account::prelude::*, asset::prelude::*, block::prelude::*, domain::prelude::*,
+        peer::prelude::*, permissions::prelude::*, role::prelude::*, transaction::*,
+        trigger::prelude::*, PaginatedQueryResult, Query, QueryBox, QueryResult,
+        VersionedPaginatedQueryResult, VersionedQueryResult,
     };
     #[cfg(feature = "warp")]
     pub use super::{QueryRequest, VersionedSignedQueryRequest};

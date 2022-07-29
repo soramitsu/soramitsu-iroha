@@ -18,7 +18,10 @@ use futures::{Stream, StreamExt, TryStreamExt};
 use iroha_actor::{broker::*, prelude::*};
 use iroha_crypto::{HashOf, MerkleTree};
 use iroha_logger::prelude::*;
-use iroha_version::scale::{DecodeVersioned, EncodeVersioned};
+use iroha_version::{
+    scale::{DecodeVersioned, EncodeVersioned},
+    try_decode_all_or_just_decode,
+};
 use pin_project::pin_project;
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -27,9 +30,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReadDirStream;
 
-use crate::{
-    block::VersionedCommittedBlock, block_sync::ContinueSync, prelude::*, sumeragi, wsv::WorldTrait,
-};
+use crate::{block::VersionedCommittedBlock, block_sync::ContinueSync, prelude::*, sumeragi};
 
 /// Message for storing committed block
 #[derive(Clone, Debug, Message)]
@@ -46,22 +47,22 @@ pub struct GetBlockHash {
 /// High level data storage representation.
 /// Provides all necessary methods to read and write data, hides implementation details.
 #[derive(Debug)]
-pub struct KuraWithIO<W: WorldTrait, IO> {
+pub struct KuraWithIO<IO> {
     // TODO: Kura doesn't have different initialisation modes!!!
     #[allow(dead_code)]
     mode: Mode,
     block_store: BlockStore<IO>,
     merkle_tree: MerkleTree<VersionedCommittedBlock>,
-    wsv: Arc<WorldStateView<W>>,
+    wsv: Arc<WorldStateView>,
     broker: Broker,
-    mailbox: u32,
+    actor_channel_capacity: u32,
 }
 
 /// Production qualification of `KuraWithIO`
-pub type Kura<W> = KuraWithIO<W, DefaultIO>;
+pub type Kura = KuraWithIO<DefaultIO>;
 
 /// Generic implementation for tests - accepting IO mocks
-impl<W: WorldTrait, IO: DiskIO> KuraWithIO<W, IO> {
+impl<IO: DiskIO> KuraWithIO<IO> {
     /// ctor
     /// # Errors
     /// Will forward error from `BlockStore` construction
@@ -69,9 +70,9 @@ impl<W: WorldTrait, IO: DiskIO> KuraWithIO<W, IO> {
         mode: Mode,
         block_store_path: &Path,
         blocks_per_file: NonZeroU64,
-        wsv: Arc<WorldStateView<W>>,
+        wsv: Arc<WorldStateView>,
         broker: Broker,
-        mailbox: u32,
+        actor_channel_capacity: u32,
         io: IO,
     ) -> Result<Self> {
         Ok(Self {
@@ -80,7 +81,7 @@ impl<W: WorldTrait, IO: DiskIO> KuraWithIO<W, IO> {
             merkle_tree: MerkleTree::new(),
             wsv,
             broker,
-            mailbox,
+            actor_channel_capacity,
         })
     }
 }
@@ -93,9 +94,6 @@ pub trait KuraTrait:
     + ContextHandler<GetBlockHash, Result = Option<HashOf<VersionedCommittedBlock>>>
     + Debug
 {
-    /// World for applying blocks which have been stored on disk
-    type World: WorldTrait;
-
     /// Construct [`Kura`].
     /// Kura will not be ready to work with before `init()` method invocation.
     /// # Errors
@@ -104,9 +102,9 @@ pub trait KuraTrait:
         mode: Mode,
         block_store_path: &Path,
         blocks_per_file: NonZeroU64,
-        wsv: Arc<WorldStateView<Self::World>>,
+        wsv: Arc<WorldStateView>,
         broker: Broker,
-        mailbox: u32,
+        actor_channel_capacity: u32,
     ) -> Result<Self>;
 
     /// Loads kura from configuration
@@ -114,7 +112,7 @@ pub trait KuraTrait:
     /// Fails if call to new fails
     async fn from_configuration(
         configuration: &config::KuraConfiguration,
-        wsv: Arc<WorldStateView<Self::World>>,
+        wsv: Arc<WorldStateView>,
         broker: Broker,
     ) -> Result<Self> {
         Self::new(
@@ -123,21 +121,19 @@ pub trait KuraTrait:
             configuration.blocks_per_storage_file,
             wsv,
             broker,
-            configuration.mailbox,
+            configuration.actor_channel_capacity,
         )
         .await
     }
 }
 
 #[async_trait]
-impl<W: WorldTrait> KuraTrait for Kura<W> {
-    type World = W;
-
+impl KuraTrait for Kura {
     async fn new(
         mode: Mode,
         block_store_path: &Path,
         blocks_per_file: NonZeroU64,
-        wsv: Arc<WorldStateView<W>>,
+        wsv: Arc<WorldStateView>,
         broker: Broker,
         mailbox: u32,
     ) -> Result<Self> {
@@ -155,9 +151,9 @@ impl<W: WorldTrait> KuraTrait for Kura<W> {
 }
 
 #[async_trait::async_trait]
-impl<W: WorldTrait, IO: DiskIO> Actor for KuraWithIO<W, IO> {
-    fn mailbox_capacity(&self) -> u32 {
-        self.mailbox
+impl<IO: DiskIO> Actor for KuraWithIO<IO> {
+    fn actor_channel_capacity(&self) -> u32 {
+        self.actor_channel_capacity
     }
 
     async fn on_start(&mut self, ctx: &mut Context<Self>) {
@@ -178,7 +174,7 @@ impl<W: WorldTrait, IO: DiskIO> Actor for KuraWithIO<W, IO> {
                     .await;
             }
             Err(error) => {
-                error!(%error, "Initialization of kura failed");
+                error!(%error, "Kura initialization failed. Try removing the peer's `blocks` directory and restarting the peer. You can also try rebuilding the peer altogether.");
                 panic!("Kura initialization failed");
             }
         }
@@ -186,19 +182,19 @@ impl<W: WorldTrait, IO: DiskIO> Actor for KuraWithIO<W, IO> {
 }
 
 #[async_trait::async_trait]
-impl<W: WorldTrait, IO: DiskIO> Handler<GetBlockHash> for KuraWithIO<W, IO> {
+impl<IO: DiskIO> Handler<GetBlockHash> for KuraWithIO<IO> {
     type Result = Option<HashOf<VersionedCommittedBlock>>;
     async fn handle(&mut self, GetBlockHash { height }: GetBlockHash) -> Self::Result {
         if height == 0 {
             return None;
         }
         // Block height starts with 1
-        self.merkle_tree.get_leaf(height - 1)
+        self.merkle_tree.get_leaf_hash(height - 1)
     }
 }
 
 #[async_trait::async_trait]
-impl<W: WorldTrait, IO: DiskIO> Handler<StoreBlock> for KuraWithIO<W, IO> {
+impl<IO: DiskIO> Handler<StoreBlock> for KuraWithIO<IO> {
     type Result = ();
 
     async fn handle(&mut self, StoreBlock(block): StoreBlock) {
@@ -212,7 +208,7 @@ impl<W: WorldTrait, IO: DiskIO> Handler<StoreBlock> for KuraWithIO<W, IO> {
     }
 }
 
-impl<W: WorldTrait, IO: DiskIO> KuraWithIO<W, IO> {
+impl<IO: DiskIO> KuraWithIO<IO> {
     /// After constructing [`Kura`] it should be initialized to be ready to work with it.
     ///
     /// # Errors
@@ -242,7 +238,7 @@ impl<W: WorldTrait, IO: DiskIO> KuraWithIO<W, IO> {
     ) -> Result<HashOf<VersionedCommittedBlock>> {
         match self.block_store.write(&block).await {
             Ok(block_hash) => {
-                self.merkle_tree = self.merkle_tree.add(block_hash);
+                self.merkle_tree.add(block_hash);
                 self.broker.issue_send(ContinueSync).await;
                 Ok(block_hash)
             }
@@ -311,6 +307,9 @@ pub enum Error {
     InconsequentialBlockWrite,
 }
 
+/// Maximum length for block file paths
+const FILENAME_MAX_LENGTH: usize = 6;
+
 impl<IO: DiskIO> BlockStore<IO> {
     /// Initialize block storage at `path`.
     ///
@@ -350,8 +349,8 @@ impl<IO: DiskIO> BlockStore<IO> {
     /// - Filesystem access failure (HW or permissions)
     ///
     pub async fn get_block_path(&self, block_height: NonZeroU64) -> Result<PathBuf> {
-        let filename = self.get_block_filename(block_height).await?;
-        Ok(self.path.join(filename))
+        let file_string = self.get_block_filename(block_height).await?;
+        Ok(self.filename_to_path(&file_string))
     }
 
     /// Append block to latest (or new) file on the disk.
@@ -366,12 +365,17 @@ impl<IO: DiskIO> BlockStore<IO> {
         block: &VersionedCommittedBlock,
     ) -> Result<HashOf<VersionedCommittedBlock>> {
         let height = NonZeroU64::new(block.header().height).ok_or(Error::ZeroBlock)?;
-        let path = self.get_block_path(height).await?;
+        let file_path = self.get_block_path(height).await?;
+
+        let mut dir_path = file_path.clone();
+        dir_path.pop();
+
+        fs::create_dir_all(dir_path).await?;
         let mut file = BufWriter::new(
             fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
+                .open(&file_path)
                 .await?,
         );
         let hash = block.hash();
@@ -403,7 +407,9 @@ impl<IO: DiskIO> BlockStore<IO> {
         #[allow(clippy::cast_possible_truncation)]
         buffer.resize(len as usize, 0);
         let _len = file_stream.read_exact(&mut buffer).await?;
-        Ok(Some(VersionedCommittedBlock::decode_versioned(&buffer)?))
+
+        let block = try_decode_all_or_just_decode!(VersionedCommittedBlock, &buffer)?;
+        Ok(Some(block))
     }
 
     /// Converts raw file stream into stream of decoded blocks
@@ -421,6 +427,25 @@ impl<IO: DiskIO> BlockStore<IO> {
         }
     }
 
+    #[allow(clippy::useless_let_if_seq)]
+    fn filename_to_path(&self, file_string: &str) -> PathBuf {
+        let dir_name;
+        let file_name;
+        if file_string.len() > FILENAME_MAX_LENGTH {
+            let (a, b) = file_string.split_at(file_string.len() - FILENAME_MAX_LENGTH);
+            dir_name = a.to_owned();
+            file_name = b.to_owned();
+        } else {
+            dir_name = "0".to_owned();
+            file_name = format!(
+                "{}{}",
+                "0".repeat(FILENAME_MAX_LENGTH - file_string.len()),
+                file_string
+            );
+        }
+        self.path.join(dir_name).join(file_name)
+    }
+
     /// Returns a stream of deserialized blocks that in order of reading from sorted storage files
     ///
     /// # Errors
@@ -429,15 +454,20 @@ impl<IO: DiskIO> BlockStore<IO> {
     ///
     pub async fn read_all(
         &self,
-    ) -> Result<impl Stream<Item = Result<VersionedCommittedBlock>> + 'static> {
+    ) -> Result<impl Stream<Item = Result<VersionedCommittedBlock>> + '_> {
         let io = self.io.clone();
         let base_indices = storage_files_base_indices(&self.path, &self.io).await?;
-        let dir_path = self.path.clone();
-        let result = tokio_stream::iter(base_indices)
-            .map(move |e| dir_path.join(e.to_string()))
+        let mut files = Vec::new();
+        for index in &base_indices {
+            files.push(self.filename_to_path(&index.to_string()));
+        }
+
+        let result = tokio_stream::iter(files)
+            .map(move |e| e)
             .then(move |e| {
                 let io = io.clone();
-                async move { io.open(e.into_os_string()).await }
+                // async move { io.open(e.into_os_string()).await }
+                async move { io.open(e.into()).await }
             })
             .map_ok(BufReader::new)
             .map_ok(Self::read_file)
@@ -463,15 +493,35 @@ async fn storage_files_base_indices<IO: DiskIO>(
     path: &Path,
     io: &IO,
 ) -> Result<BTreeSet<NonZeroU64>> {
-    let bases = io
+    let dirs: Vec<(String, IO::Dir)> = io
         .read_dir(path.to_path_buf())
         .await?
         .filter_map(|item| async {
-            item.ok()
-                .and_then(|e| e.to_string_lossy().parse::<NonZeroU64>().ok())
+            if let Ok(item) = item {
+                let dir_name = item.to_string_lossy().into_owned();
+                match io.read_dir(path.join(dir_name.clone())).await {
+                    Ok(v) => Some((dir_name, v)),
+                    Err(_) => None,
+                }
+            } else {
+                None
+            }
         })
-        .collect::<BTreeSet<_>>()
+        .collect()
         .await;
+
+    let mut bases = BTreeSet::<NonZeroU64>::new();
+    for (dir_string, dir) in dirs {
+        let files_vec: Vec<io::Result<OsString>> = dir.collect().await;
+        for file_string in files_vec.into_iter().flatten() {
+            let maybe_num =
+                format!("{}{}", dir_string, file_string.to_string_lossy()).parse::<NonZeroU64>();
+            if let Ok(num) = maybe_num {
+                bases.insert(num);
+            }
+        }
+    }
+
     Ok(bases)
 }
 
@@ -487,7 +537,7 @@ pub mod config {
 
     const DEFAULT_BLOCKS_PER_STORAGE_FILE: u64 = 1000_u64;
     const DEFAULT_BLOCK_STORE_PATH: &str = "./blocks";
-    const DEFAULT_MAILBOX_SIZE: u32 = 100;
+    const DEFAULT_ACTOR_CHANNEL_CAPACITY: u32 = 100;
 
     /// Configuration of kura
     #[derive(Clone, Deserialize, Serialize, Debug, Configurable, PartialEq, Eq)]
@@ -503,9 +553,9 @@ pub mod config {
         /// Maximum number of blocks to write into single storage file
         #[serde(default = "default_blocks_per_storage_file")]
         pub blocks_per_storage_file: NonZeroU64,
-        /// Default mailbox size
-        #[serde(default = "default_mailbox_size")]
-        pub mailbox: u32,
+        /// Default buffer capacity of actor's MPSC channel
+        #[serde(default = "default_actor_channel_capacity")]
+        pub actor_channel_capacity: u32,
     }
 
     impl Default for KuraConfiguration {
@@ -514,7 +564,7 @@ pub mod config {
                 init_mode: Mode::default(),
                 block_store_path: default_block_store_path(),
                 blocks_per_storage_file: default_blocks_per_storage_file(),
-                mailbox: default_mailbox_size(),
+                actor_channel_capacity: default_actor_channel_capacity(),
             }
         }
     }
@@ -544,8 +594,8 @@ pub mod config {
         )
     }
 
-    const fn default_mailbox_size() -> u32 {
-        DEFAULT_MAILBOX_SIZE
+    const fn default_actor_channel_capacity() -> u32 {
+        DEFAULT_ACTOR_CHANNEL_CAPACITY
     }
 }
 
@@ -616,7 +666,7 @@ mod tests {
     #[tokio::test]
     async fn strict_init_kura() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir.");
-        assert!(Kura::<World>::new(
+        assert!(Kura::new(
             Mode::Strict,
             temp_dir.path(),
             NonZeroU64::new(TEST_STORAGE_FILE_SIZE).unwrap(),
@@ -631,7 +681,7 @@ mod tests {
         .is_ok());
     }
 
-    fn get_transaction_validator() -> TransactionValidator<World> {
+    fn get_transaction_validator() -> TransactionValidator {
         let tx_limits = TransactionLimits {
             max_instruction_number: 4096,
             max_wasm_size_bytes: 0,
@@ -723,7 +773,7 @@ mod tests {
             .expect("Failed to sign blocks.")
             .commit();
         let dir = tempfile::tempdir().unwrap();
-        let mut kura = Kura::<World>::new(
+        let mut kura = Kura::new(
             Mode::Strict,
             dir.path(),
             NonZeroU64::new(tests::TEST_STORAGE_FILE_SIZE).unwrap(),
@@ -839,7 +889,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let written = fs::write(dir.path().join("1"), vec![1; 40]).await;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .create(&dir.path().join("0"))
+            .await
+            .unwrap();
+        let written = fs::write(dir.path().join("0/01"), vec![1; 40]).await;
         assert!(matches!(written, Ok(_)));
         let expected_read_fail = block_store
             .read_all()
@@ -915,21 +970,57 @@ mod tests {
             type Dir = futures::stream::Iter<std::vec::IntoIter<io::Result<OsString>>>;
             type File = UnreliableFile;
 
-            async fn read_dir(&self, _path: PathBuf) -> io::Result<Self::Dir> {
-                Ok(futures::stream::iter(
-                    self.files
-                        .keys()
-                        .cloned()
-                        .map(Ok)
-                        .collect::<Vec<_>>()
-                        .into_iter(),
-                ))
+            #[allow(clippy::unnecessary_unwrap, clippy::needless_collect)]
+            async fn read_dir(&self, path: PathBuf) -> io::Result<Self::Dir> {
+                let mut path_str = path.to_str().ok_or(io::ErrorKind::InvalidInput)?;
+                let path_string;
+                if !path_str.ends_with('/') {
+                    path_string = format!("{}/", path_str);
+                    path_str = &path_string;
+                }
+
+                let mut already_included_directories = Vec::new();
+
+                let directories_maybe = self
+                    .files
+                    .keys()
+                    .cloned()
+                    .map(|file_os_string| {
+                        let file_str = file_os_string.to_str();
+                        if file_str.is_some() && file_str.unwrap().starts_with(path_str) {
+                            let path_buf: PathBuf =
+                                file_str.unwrap().strip_prefix(path_str).unwrap().into();
+
+                            // Get the furthest to the left component of the path left
+                            // after we remove the directory.
+                            match path_buf.components().next() {
+                                Some(top_borrowed) => {
+                                    let top = top_borrowed.as_os_str().to_owned();
+                                    if already_included_directories.contains(&top) {
+                                        let error = std::io::Error::from_raw_os_error(44);
+                                        Err(error)
+                                    } else {
+                                        already_included_directories.push(top.clone());
+                                        Ok(top.as_os_str().into())
+                                    }
+                                }
+                                None => {
+                                    let error = std::io::Error::from_raw_os_error(43);
+                                    Err(error)
+                                }
+                            }
+                        } else {
+                            let error = std::io::Error::from_raw_os_error(42);
+                            Err(error)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                Ok(futures::stream::iter(directories_maybe.into_iter()))
             }
 
             async fn open(&self, path: OsString) -> io::Result<Self::File> {
-                PathBuf::from(path)
-                    .file_name()
-                    .and_then(|e| self.files.get(e))
+                self.files
+                    .get(&path)
                     .map(Arc::clone)
                     .map(Self::File::open)
                     .unwrap()
@@ -942,7 +1033,7 @@ mod tests {
             NonZeroU64::new(tests::TEST_STORAGE_FILE_SIZE).unwrap(),
             UnreliableIO {
                 files: vec![(
-                    "1".into(),
+                    "dir/0/000001".into(),
                     Arc::new(vec![
                         Ok(vec![122, 0, 0, 0, 0, 0, 0, 0]),
                         Err(io::ErrorKind::TimedOut),

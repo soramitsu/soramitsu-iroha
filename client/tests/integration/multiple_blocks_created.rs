@@ -15,7 +15,7 @@ const N_BLOCKS: usize = 510;
 #[test]
 fn long_multiple_blocks_created() {
     // Given
-    let (_rt, network, mut iroha_client) = <Network>::start_test_with_runtime(4, 1);
+    let (_rt, network, iroha_client) = <Network>::start_test_with_runtime(4, 1);
     wait_for_genesis_committed(&network.clients(), 0);
     let pipeline_time = Configuration::pipeline_time();
 
@@ -26,8 +26,7 @@ fn long_multiple_blocks_created() {
         .into();
     let create_account = RegisterBox::new(Account::new(account_id.clone(), [public_key]));
     let asset_definition_id: AssetDefinitionId = "xor#domain".parse().expect("Valid");
-    let create_asset =
-        RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()).build());
+    let create_asset = RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()));
 
     iroha_client
         .submit_all(vec![

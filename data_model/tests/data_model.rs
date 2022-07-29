@@ -10,7 +10,7 @@ use iroha_core::{
 };
 use iroha_data_model::{prelude::*, ParseError};
 use small::SmallStr;
-use test_network::{Peer as TestPeer, TestRuntime};
+use test_network::{prepare_test_for_nextest, Peer as TestPeer, PeerBuilder, TestRuntime};
 use tokio::runtime::Runtime;
 
 fn asset_id_new(
@@ -133,19 +133,17 @@ mod register {
     }
 
     pub fn asset_definition(asset_name: &str, domain_name: &str) -> RegisterBox {
-        RegisterBox::new(
-            AssetDefinition::quantity(AssetDefinitionId::new(
-                asset_name.parse().expect("Valid"),
-                domain_name.parse().expect("Valid"),
-            ))
-            .build(),
-        )
+        RegisterBox::new(AssetDefinition::quantity(AssetDefinitionId::new(
+            asset_name.parse().expect("Valid"),
+            domain_name.parse().expect("Valid"),
+        )))
     }
 }
 
 #[allow(unused_must_use)]
 #[test]
 fn find_rate_and_make_exchange_isi_should_succeed() {
+    prepare_test_for_nextest!();
     let kp = KeyPair::new(
         PublicKey::from_str(
             r#"ed01207233bfc89dcbd68c19fde6ce6158225298ec1131b6a130d1aeb454c1ab5183c0"#,
@@ -168,20 +166,25 @@ fn find_rate_and_make_exchange_isi_should_succeed() {
             "wonderland".parse().expect("Valid"),
             kp.public_key().clone(),
         ),
-        &configuration.genesis,
+        &Some(configuration.genesis.clone()),
         &configuration.sumeragi.transaction_limits,
     )
+    .unwrap()
     .unwrap();
     let rt = Runtime::test();
     let mut client_configuration = get_client_config(&configuration.sumeragi.key_pair);
 
-    rt.block_on(peer.start_with_config_permissions(configuration, genesis, AllowAll, AllowAll));
+    let builder = PeerBuilder::new()
+        .with_configuration(configuration)
+        .with_instruction_validator(AllowAll)
+        .with_genesis(genesis);
+
+    rt.block_on(builder.start_with_peer(&mut peer));
     thread::sleep(pipeline_time);
 
     client_configuration.torii_api_url =
         SmallStr::from_string("http://".to_owned() + &peer.api_address);
-    let mut iroha_client =
-        Client::new(&client_configuration).expect("Invalid client configuration");
+    let iroha_client = Client::new(&client_configuration).expect("Invalid client configuration");
     iroha_client
         .submit_all(vec![
             register::domain("exchange").into(),

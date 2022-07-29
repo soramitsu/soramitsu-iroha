@@ -3,16 +3,17 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{
+    borrow::ToOwned as _,
     collections::btree_map,
     format,
     string::{String, ToString as _},
     vec,
     vec::Vec,
 };
-use core::fmt;
 #[cfg(feature = "std")]
 use std::collections::btree_map;
 
+use derive_more::Display;
 use iroha_schema::IntoSchema;
 use iroha_version::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -74,7 +75,23 @@ impl<I: Iterator> Iterator for Paginated<I> {
 
 /// Structure for pagination requests
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, Decode, Encode, IntoSchema,
+    Debug,
+    Display,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Deserialize,
+    Serialize,
+    Decode,
+    Encode,
+    IntoSchema,
+)]
+#[display(
+    fmt = "{}--{}",
+    "start.unwrap_or(0)",
+    "limit.map_or(\".inf\".to_owned(), |n| n.to_string())"
 )]
 pub struct Pagination {
     /// start of indexing
@@ -91,18 +108,10 @@ impl Pagination {
 }
 
 /// Error for pagination
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Display, Clone, Eq, PartialEq)]
+#[display(fmt = "Failed to decode pagination. Error: {_0}")]
 pub struct PaginateError(pub core::num::ParseIntError);
 
-impl fmt::Display for PaginateError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Failed to decode pagination. Error occurred in one of numbers: {}",
-            self.0
-        )
-    }
-}
 #[cfg(feature = "std")]
 impl std::error::Error for PaginateError {}
 

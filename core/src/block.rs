@@ -11,7 +11,12 @@ use std::{collections::BTreeSet, error::Error, iter, marker::PhantomData};
 use dashmap::{mapref::one::Ref as MapRef, DashMap};
 use eyre::{eyre, Context, Result};
 use iroha_crypto::{HashOf, KeyPair, MerkleTree, SignatureOf, SignaturesOf};
-use iroha_data_model::{current_time, events::prelude::*, transaction::prelude::*};
+use iroha_data_model::{
+    block_value::{BlockHeaderValue, BlockValue},
+    current_time,
+    events::prelude::*,
+    transaction::prelude::*,
+};
 use iroha_schema::IntoSchema;
 use iroha_version::{declare_versioned_with_scale, version_with_scale};
 use parity_scale_codec::{Decode, Encode};
@@ -24,15 +29,15 @@ use crate::{
         view_change::{Proof, ProofChain as ViewChangeProofs},
     },
     tx::{TransactionValidator, VersionedAcceptedTransaction},
-    wsv::WorldTrait,
 };
 
 const PIPELINE_TIME_MS: u64 =
-    DEFAULT_BLOCK_TIME_MS + DEFAULT_COMMIT_TIME_MS + DEFAULT_TX_RECEIPT_TIME_MS;
+    DEFAULT_BLOCK_TIME_MS + DEFAULT_COMMIT_TIME_LIMIT_MS + DEFAULT_TX_RECEIPT_TIME_LIMIT_MS;
 
 /// Default estimation of consensus duration
 #[allow(clippy::integer_division)]
-pub const DEFAULT_CONSENSUS_ESTIMATION_MS: u64 = (DEFAULT_COMMIT_TIME_MS + PIPELINE_TIME_MS) / 2;
+pub const DEFAULT_CONSENSUS_ESTIMATION_MS: u64 =
+    (DEFAULT_COMMIT_TIME_LIMIT_MS + PIPELINE_TIME_MS) / 2;
 
 /// The chain of the previous block hash. If there is no previous
 /// block - the blockchain is empty.
@@ -311,10 +316,7 @@ impl BlockHeader {
 
 impl ChainedBlock {
     /// Validate block transactions against current state of the world.
-    pub fn validate<W: WorldTrait>(
-        self,
-        transaction_validator: &TransactionValidator<W>,
-    ) -> VersionedValidBlock {
+    pub fn validate(self, transaction_validator: &TransactionValidator) -> VersionedValidBlock {
         let mut txs = Vec::new();
         let mut rejected = Vec::new();
 
@@ -336,12 +338,14 @@ impl ChainedBlock {
             .iter()
             .map(VersionedValidTransaction::hash)
             .collect::<MerkleTree<_>>()
-            .root_hash();
+            .hash()
+            .unwrap_or(Hash::zeroed().typed());
         header.rejected_transactions_hash = rejected
             .iter()
             .map(VersionedRejectedTransaction::hash)
             .collect::<MerkleTree<_>>()
-            .root_hash();
+            .hash()
+            .unwrap_or(Hash::zeroed().typed());
         let event_recommendations = self.event_recommendations;
         // TODO: Validate Event recommendations somehow?
         ValidBlock {
@@ -400,10 +404,7 @@ impl VersionedValidBlock {
 
     /// Validate block transactions against current state of the world.
     #[must_use]
-    pub fn revalidate<W: WorldTrait>(
-        self,
-        transaction_validator: &TransactionValidator<W>,
-    ) -> Self {
+    pub fn revalidate(self, transaction_validator: &TransactionValidator) -> Self {
         self.into_v1().revalidate(transaction_validator).into()
     }
 
@@ -432,7 +433,7 @@ impl VersionedValidBlock {
     }
 
     /// Checks if block has transactions that are already in blockchain.
-    pub fn has_committed_transactions<W: WorldTrait>(&self, wsv: &WorldStateView<W>) -> bool {
+    pub fn has_committed_transactions(&self, wsv: &WorldStateView) -> bool {
         self.as_v1().has_committed_transactions(wsv)
     }
 
@@ -446,9 +447,9 @@ impl VersionedValidBlock {
     ///
     /// # Errors
     /// Returns the error description if validation doesn't work.
-    pub fn validation_check<W: WorldTrait>(
+    pub fn validation_check(
         &self,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
         latest_block: &HashOf<VersionedCommittedBlock>,
         latest_view_change: &HashOf<Proof>,
         block_height: u64,
@@ -546,10 +547,7 @@ impl ValidBlock {
 
     /// Validate block transactions against current state of the world.
     #[must_use]
-    pub fn revalidate<W: WorldTrait>(
-        self,
-        transaction_validator: &TransactionValidator<W>,
-    ) -> Self {
+    pub fn revalidate(self, transaction_validator: &TransactionValidator) -> Self {
         Self {
             signatures: self.signatures,
             ..ChainedBlock {
@@ -597,7 +595,7 @@ impl ValidBlock {
     }
 
     /// Checks if block has transactions that are already in blockchain.
-    pub fn has_committed_transactions<W: WorldTrait>(&self, wsv: &WorldStateView<W>) -> bool {
+    pub fn has_committed_transactions(&self, wsv: &WorldStateView) -> bool {
         self.transactions
             .iter()
             .any(|transaction| transaction.is_in_blockchain(wsv))
@@ -663,14 +661,12 @@ impl From<&ValidBlock> for Vec<Event> {
                 )
                 .into()
             }))
-            .chain(iter::once(
-                PipelineEvent::new(
-                    PipelineEntityKind::Block,
-                    PipelineStatus::Validating,
-                    block.hash().into(),
-                )
-                .into(),
-            ))
+            .chain([PipelineEvent::new(
+                PipelineEntityKind::Block,
+                PipelineStatus::Validating,
+                block.hash().into(),
+            )
+            .into()])
             .collect()
     }
 }
@@ -715,6 +711,45 @@ impl VersionedCommittedBlock {
         self.as_v1()
             .verified_signatures()
             .map(SignatureOf::transmute_ref)
+    }
+
+    /// Converts block to [`iroha_data_model`] representation for use in e.g. queries.
+    pub fn into_value(self) -> BlockValue {
+        let current_block_hash = self.hash();
+
+        let CommittedBlock {
+            header,
+            rejected_transactions,
+            transactions,
+            event_recommendations,
+            ..
+        } = self.into_v1();
+        let BlockHeader {
+            timestamp,
+            height,
+            previous_block_hash,
+            transactions_hash,
+            rejected_transactions_hash,
+            invalidated_blocks_hashes,
+            ..
+        } = header;
+
+        let header_value = BlockHeaderValue {
+            timestamp,
+            height,
+            previous_block_hash: *previous_block_hash,
+            transactions_hash,
+            rejected_transactions_hash,
+            invalidated_blocks_hashes: invalidated_blocks_hashes.into_iter().map(|h| *h).collect(),
+            current_block_hash: Hash::from(current_block_hash),
+        };
+
+        BlockValue {
+            header: header_value,
+            transactions,
+            rejected_transactions,
+            event_recommendations,
+        }
     }
 }
 

@@ -12,7 +12,7 @@ use iroha_core::{
 };
 use iroha_data_model::prelude::*;
 use iroha_version::Encode;
-use test_network::{get_key_pair, Peer as TestPeer, TestRuntime};
+use test_network::{get_key_pair, Peer as TestPeer, PeerBuilder, TestRuntime};
 use tokio::runtime::Runtime;
 
 const MINIMUM_SUCCESS_REQUEST_RATIO: f32 = 0.9;
@@ -32,17 +32,16 @@ fn query_requests(criterion: &mut Criterion) {
             "wonderland".parse().expect("Valid"),
             get_key_pair().public_key().clone(),
         ),
-        &configuration.genesis,
+        &Some(configuration.genesis.clone()),
         &configuration.sumeragi.transaction_limits,
     )
     .expect("genesis creation failed");
 
-    rt.block_on(peer.start_with_config_permissions(
-        configuration.clone(),
-        genesis,
-        AllowAll,
-        AllowAll,
-    ));
+    let builder = PeerBuilder::new()
+        .with_configuration(configuration.clone())
+        .with_into_genesis(genesis);
+
+    rt.block_on(builder.start_with_peer(&mut peer));
     configuration
         .logger
         .max_log_level
@@ -57,8 +56,7 @@ fn query_requests(criterion: &mut Criterion) {
         .into();
     let create_account = RegisterBox::new(Account::new(account_id.clone(), [public_key]));
     let asset_definition_id = AssetDefinitionId::new("xor".parse().expect("Valid"), domain_id);
-    let create_asset =
-        RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()).build());
+    let create_asset = RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()));
     let quantity: u32 = 200;
     let mint_asset = MintBox::new(
         Value::U32(quantity),
@@ -76,7 +74,7 @@ fn query_requests(criterion: &mut Criterion) {
         client_config.torii_telemetry_url =
             small::SmallStr::from_string(format!("http://{}", client_config.torii_telemetry_url));
     }
-    let mut iroha_client = Client::new(&client_config).expect("Invalid client configuration");
+    let iroha_client = Client::new(&client_config).expect("Invalid client configuration");
     thread::sleep(std::time::Duration::from_millis(5000));
 
     let _ = iroha_client
@@ -133,11 +131,14 @@ fn instruction_submits(criterion: &mut Criterion) {
             "wonderland".parse().expect("Valid"),
             configuration.public_key.clone(),
         ),
-        &configuration.genesis,
+        &Some(configuration.genesis.clone()),
         &configuration.sumeragi.transaction_limits,
     )
     .expect("failed to create genesis");
-    rt.block_on(peer.start_with_config_permissions(configuration, genesis, AllowAll, AllowAll));
+    let builder = PeerBuilder::new()
+        .with_configuration(configuration)
+        .with_into_genesis(genesis);
+    rt.block_on(builder.start_with_peer(&mut peer));
     let mut group = criterion.benchmark_group("instruction-requests");
     let domain_id: DomainId = "domain".parse().expect("Valid");
     let create_domain = RegisterBox::new(Domain::new(domain_id.clone()));
@@ -157,7 +158,7 @@ fn instruction_submits(criterion: &mut Criterion) {
         client_config.torii_telemetry_url =
             small::SmallStr::from_string(format!("http://{}", client_config.torii_telemetry_url));
     }
-    let mut iroha_client = Client::new(&client_config).expect("Invalid client configuration");
+    let iroha_client = Client::new(&client_config).expect("Invalid client configuration");
     thread::sleep(std::time::Duration::from_millis(5000));
     let _ = iroha_client
         .submit_all(vec![create_domain.into(), create_account.into()])

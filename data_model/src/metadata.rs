@@ -2,12 +2,14 @@
 //! transactions and assets.
 
 #[cfg(not(feature = "std"))]
-use alloc::{collections::btree_map, fmt, format, string::String, vec::Vec};
+use alloc::{collections::btree_map, format, string::String, vec::Vec};
 use core::borrow::Borrow;
 #[cfg(feature = "std")]
-use std::{collections::btree_map, fmt};
+use std::collections::btree_map;
 
 use derive_more::Display;
+#[cfg(feature = "ffi_api")]
+use iroha_ffi::ffi_bindgen;
 use iroha_schema::IntoSchema;
 use parity_scale_codec::{Decode, Encode};
 use serde::{Deserialize, Serialize};
@@ -18,18 +20,13 @@ use crate::{Name, Value};
 pub type UnlimitedMetadata = btree_map::BTreeMap<Name, Value>;
 
 /// Limits for [`Metadata`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Decode, Encode, Deserialize, Serialize)]
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, Decode, Encode, Deserialize, Serialize)]
+#[display(fmt = "{max_len}L, {max_entry_byte_size}B")]
 pub struct Limits {
     /// Maximum number of entries
     pub max_len: u32,
     /// Maximum length of entry
     pub max_entry_byte_size: u32,
-}
-
-impl fmt::Display for Limits {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(self, f)
-    }
 }
 
 /// Metadata related errors.
@@ -78,32 +75,36 @@ impl Limits {
 /// Collection of parameters by their names with checked insertion.
 #[derive(
     Debug,
+    Display,
     Clone,
     Default,
     PartialEq,
     Eq,
-    PartialOrd,
-    Ord,
     Decode,
     Encode,
     Deserialize,
     Serialize,
     IntoSchema,
+    PartialOrd,
+    Ord,
 )]
 #[serde(transparent)]
+#[allow(clippy::multiple_inherent_impl)]
+#[display(fmt = "Metadata")]
 pub struct Metadata {
-    map: UnlimitedMetadata,
+    map: btree_map::BTreeMap<Name, Value>,
 }
 
 /// A path slice, composed of [`Name`]s.
 pub type Path = [Name];
 
+#[cfg_attr(feature = "ffi_api", ffi_bindgen)]
 impl Metadata {
     /// Constructor.
     #[inline]
     pub fn new() -> Self {
         Self {
-            map: btree_map::BTreeMap::new(),
+            map: UnlimitedMetadata::new(),
         }
     }
 
@@ -129,20 +130,25 @@ impl Metadata {
         map.get(key)
     }
 
-    /// Remove leaf node in metadata, given path. If the path is
-    /// malformed, or incorrect (if e.g. any of interior path segments
-    /// are not [`Metadata`] instances) return `None`. Else return the
-    /// owned value corresponding to that path.
-    pub fn nested_remove(&mut self, path: &Path) -> Option<Value> {
-        let key = path.last()?;
-        let mut map = &mut self.map;
-        for k in path.iter().take(path.len() - 1) {
-            map = match map.get_mut(k)? {
-                Value::LimitedMetadata(data) => &mut data.map,
-                _ => return None,
-            };
-        }
-        map.remove(key)
+    /// Check if the internal map contains the given key.
+    pub fn contains(&self, key: &Name) -> bool {
+        self.map.contains_key(key)
+    }
+
+    /// Iterate over key/value pairs stored in the internal map.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&Name, &Value)> {
+        self.map.iter()
+    }
+}
+
+impl Metadata {
+    /// Get the `Some(&Value)` associated to `key`. Return `None` if not found.
+    #[inline]
+    pub fn get<K: Ord + ?Sized>(&self, key: &K) -> Option<&Value>
+    where
+        Name: Borrow<K>,
+    {
+        self.map.get(key)
     }
 
     /// Insert the given [`Value`] into the given path. If the path is
@@ -177,7 +183,6 @@ impl Metadata {
                 _ => return Err(Error::InvalidSegment(k.clone())),
             };
         }
-        check_size_limits(key, value.clone(), limits)?;
         layer.insert_with_limits(key.clone(), value, limits)
     }
 
@@ -201,17 +206,10 @@ impl Metadata {
         check_size_limits(&key, value.clone(), limits)?;
         Ok(self.map.insert(key, value))
     }
+}
 
-    /// Returns a `Some(reference)` to the value corresponding to
-    /// the key, and `None` if not found.
-    #[inline]
-    pub fn get<K: Ord + ?Sized>(&self, key: &K) -> Option<&Value>
-    where
-        Name: Borrow<K>,
-    {
-        self.map.get(key)
-    }
-
+#[cfg(feature = "mutable_api")]
+impl Metadata {
     /// Removes a key from the map, returning the owned
     /// `Some(value)` at the key if the key was previously in the
     /// map, else `None`.
@@ -221,6 +219,22 @@ impl Metadata {
         Name: Borrow<K>,
     {
         self.map.remove(key)
+    }
+
+    /// Remove leaf node in metadata, given path. If the path is
+    /// malformed, or incorrect (if e.g. any of interior path segments
+    /// are not [`Metadata`] instances) return `None`. Else return the
+    /// owned value corresponding to that path.
+    pub fn nested_remove(&mut self, path: &Path) -> Option<Value> {
+        let key = path.last()?;
+        let mut map = &mut self.map;
+        for k in path.iter().take(path.len() - 1) {
+            map = match map.get_mut(k)? {
+                Value::LimitedMetadata(data) => &mut data.map,
+                _ => return None,
+            };
+        }
+        map.remove(key)
     }
 }
 
@@ -262,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mutable_api")]
     fn nested_fns_ignore_empty_path() {
         let mut metadata = Metadata::new();
         let empty_path = vec![];
@@ -274,6 +289,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::unwrap_used)]
+    #[cfg(feature = "mutable_api")]
     fn nesting_inserts_removes() -> Result<(), TestError> {
         let mut metadata = Metadata::new();
         let limits = Limits::new(1024, 1024);
@@ -307,6 +323,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "mutable_api")]
     fn non_existent_path_segment_fails() -> Result<(), TestError> {
         let mut metadata = Metadata::new();
         let limits = Limits::new(10, 15);

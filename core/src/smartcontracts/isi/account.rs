@@ -1,5 +1,5 @@
 //! This module contains implementations of smart-contract traits and instructions for [`Account`] structure
-//! and implementations of [`Query`]'s to [`WorldStateView<W>`] about [`Account`].
+//! and implementations of [`Query`]'s to [`WorldStateView`] about [`Account`].
 
 use iroha_data_model::prelude::*;
 use iroha_telemetry::metrics;
@@ -15,14 +15,59 @@ use crate::{ValidQuery, WorldStateView};
 pub mod isi {
     use super::{super::prelude::*, *};
 
-    impl<W: WorldTrait> Execute<W> for Mint<Account, PublicKey> {
+    #[allow(clippy::expect_used, clippy::unwrap_in_result)]
+    impl Execute for Register<Asset> {
+        type Error = Error;
+
+        #[metrics(+"register_asset")]
+        fn execute(
+            self,
+            _authority: <Account as Identifiable>::Id,
+            wsv: &WorldStateView,
+        ) -> Result<(), Self::Error> {
+            let asset_id = self.object.id();
+
+            match wsv.asset(asset_id) {
+                Err(FindError::Asset(_)) => {
+                    assert_can_register(&asset_id.definition_id, wsv, self.object.value())?;
+                    wsv.asset_or_insert(asset_id, self.object.value().clone())
+                        .expect("Account exists");
+                    Ok(())
+                }
+                Err(e) => Err(Error::Find(Box::new(e))),
+                Ok(_) => Err(Error::Repetition(
+                    InstructionType::Register,
+                    IdBox::AssetId(asset_id.clone()),
+                )),
+            }
+        }
+    }
+
+    impl Execute for Unregister<Asset> {
+        type Error = Error;
+
+        #[metrics(+"unregister_asset")]
+        fn execute(self, _authority: AccountId, wsv: &WorldStateView) -> Result<(), Self::Error> {
+            let asset_id = self.object_id;
+            let account_id = asset_id.account_id.clone();
+
+            wsv.modify_account(&account_id, |account| {
+                account
+                    .remove_asset(&asset_id)
+                    .map(|asset| AccountEvent::Asset(AssetEvent::Removed(asset.id().clone())))
+                    .ok_or_else(|| Error::Find(Box::new(FindError::Asset(asset_id))))
+            })
+        }
+    }
+
+    impl Execute for Mint<Account, PublicKey> {
         type Error = Error;
 
         #[metrics(+"mint_account_pubkey")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let public_key = self.object;
@@ -40,14 +85,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Burn<Account, PublicKey> {
+    impl Execute for Burn<Account, PublicKey> {
         type Error = Error;
 
         #[metrics(+"burn_account_pubkey")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let public_key = self.object;
@@ -67,14 +112,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Mint<Account, SignatureCheckCondition> {
+    impl Execute for Mint<Account, SignatureCheckCondition> {
         type Error = Error;
 
         #[metrics(+"mint_account_signature_check_condition")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let signature_check_condition = self.object;
@@ -86,14 +131,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for SetKeyValue<Account, Name, Value> {
+    impl Execute for SetKeyValue<Account, Name, Value> {
         type Error = Error;
 
         #[metrics(+"set_key_value_account_string_value")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.object_id;
 
@@ -111,14 +156,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for RemoveKeyValue<Account, Name> {
+    impl Execute for RemoveKeyValue<Account, Name> {
         type Error = Error;
 
         #[metrics(+"remove_account_key_value")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.object_id;
 
@@ -133,14 +178,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Grant<Account, PermissionToken> {
+    impl Execute for Grant<Account, PermissionToken> {
         type Error = Error;
 
         #[metrics(+"grant_account_permission_token")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let permission = self.object;
@@ -156,15 +201,11 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Revoke<Account, PermissionToken> {
+    impl Execute for Revoke<Account, PermissionToken> {
         type Error = Error;
 
         #[metrics(+"revoke_account_permission_token")]
-        fn execute(
-            self,
-            _authority: AccountId,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
+        fn execute(self, _authority: AccountId, wsv: &WorldStateView) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let permission = self.object;
 
@@ -178,14 +219,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Grant<Account, RoleId> {
+    impl Execute for Grant<Account, RoleId> {
         type Error = Error;
 
         #[metrics(+"grant_account_role")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let role_id = self.object;
@@ -203,20 +244,16 @@ pub mod isi {
                     ));
                 }
 
-                Ok(AccountEvent::PermissionAdded(account_id))
+                Ok(AccountEvent::RoleGranted(account_id))
             })
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Revoke<Account, RoleId> {
+    impl Execute for Revoke<Account, RoleId> {
         type Error = Error;
 
         #[metrics(+"revoke_account_role")]
-        fn execute(
-            self,
-            _authority: AccountId,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
+        fn execute(self, _authority: AccountId, wsv: &WorldStateView) -> Result<(), Self::Error> {
             let account_id = self.destination_id;
             let role_id = self.object;
 
@@ -227,11 +264,35 @@ pub mod isi {
 
             wsv.modify_account(&account_id.clone(), |account| {
                 if !account.remove_role(&role_id) {
-                    return Err(Error::Find(Box::new(FindError::Account(account_id))));
+                    return Err(FindError::Account(account_id).into());
                 }
 
-                Ok(AccountEvent::PermissionRemoved(account_id))
+                Ok(AccountEvent::RoleRevoked(account_id))
             })
+        }
+    }
+
+    /// Assert that this asset can be registered to an account.
+    fn assert_can_register(
+        definition_id: &AssetDefinitionId,
+        wsv: &WorldStateView,
+        value: &AssetValue,
+    ) -> Result<(), Error> {
+        let definition = asset::isi::assert_asset_type(definition_id, wsv, value.value_type())?;
+        match definition.mintable() {
+            Mintable::Infinitely => Ok(()),
+            Mintable::Not => Err(Error::Mintability(MintabilityError::MintUnmintable)),
+            Mintable::Once => {
+                if !value.is_zero_value() {
+                    wsv.modify_asset_definition_entry(definition_id, |entry| {
+                        entry.forbid_minting()?;
+                        Ok(AssetDefinitionEvent::MintabilityChanged(
+                            definition_id.clone(),
+                        ))
+                    })?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -240,20 +301,19 @@ pub mod isi {
 pub mod query {
 
     use eyre::{Result, WrapErr};
-    use iroha_logger::prelude::*;
 
     use super::{super::Evaluate, *};
-    use crate::smartcontracts::{isi::prelude::WorldTrait, query::Error, FindError};
+    use crate::smartcontracts::{query::Error, FindError};
 
-    impl<W: WorldTrait> ValidQuery<W> for FindRolesByAccountId {
-        #[log]
+    impl ValidQuery for FindRolesByAccountId {
         #[metrics(+"find_roles_by_account_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let account_id = self
                 .id
                 .evaluate(wsv, &Context::new())
                 .wrap_err("Failed to evaluate account id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%account_id, roles=?wsv.world.roles);
             let roles = wsv.map_account(&account_id, |account| {
                 account.roles().cloned().collect::<Vec<_>>()
             })?;
@@ -261,15 +321,15 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindPermissionTokensByAccountId {
-        #[log]
+    impl ValidQuery for FindPermissionTokensByAccountId {
         #[metrics(+"find_permission_tokens_by_account_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let account_id = self
                 .id
                 .evaluate(wsv, &Context::new())
                 .wrap_err("Failed to evaluate account id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%account_id, accounts=?wsv.world.domains);
             let tokens = wsv.map_account(&account_id, |account| {
                 wsv.account_permission_tokens(account)
             })?;
@@ -277,10 +337,9 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAllAccounts {
-        #[log]
+    impl ValidQuery for FindAllAccounts {
         #[metrics(+"find_all_accounts")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let mut vec = Vec::new();
             for domain in wsv.domains().iter() {
                 for account in domain.accounts() {
@@ -291,28 +350,28 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAccountById {
-        #[log]
+    impl ValidQuery for FindAccountById {
         #[metrics(+"find_account_by_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             wsv.map_account(&id, Clone::clone).map_err(Into::into)
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAccountsByName {
-        #[log]
+    impl ValidQuery for FindAccountsByName {
         #[metrics(+"find_account_by_name")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let name = self
                 .name
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get account name")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%name);
             let mut vec = Vec::new();
             for domain in wsv.domains().iter() {
                 for account in domain.accounts() {
@@ -325,23 +384,22 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAccountsByDomainId {
-        #[log]
+    impl ValidQuery for FindAccountsByDomainId {
         #[metrics(+"find_accounts_by_domain_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .domain_id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get domain id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             Ok(wsv.domain(&id)?.accounts().cloned().collect::<Vec<_>>())
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAccountKeyValueByIdAndKey {
-        #[log]
+    impl ValidQuery for FindAccountKeyValueByIdAndKey {
         #[metrics(+"find_account_key_value_by_id_and_key")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .id
                 .evaluate(wsv, &Context::default())
@@ -352,16 +410,17 @@ pub mod query {
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get key")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id, %key);
             wsv.map_account(&id, |account| {
                 account.metadata().get(&key).map(Clone::clone)
             })?
-            .ok_or_else(|| query::Error::Find(Box::new(FindError::MetadataKey(key))))
+            .ok_or_else(|| FindError::MetadataKey(key).into())
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAccountsWithAsset {
+    impl ValidQuery for FindAccountsWithAsset {
         #[metrics(+"find_accounts_with_asset")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let asset_definition_id = self
                 .asset_definition_id
                 .evaluate(wsv, &Context::default())

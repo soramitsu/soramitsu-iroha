@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=ubuntu:20.04
+ARG BASE_IMAGE=ubuntu:22.04
 FROM $BASE_IMAGE AS rust-base
 
 ENV CARGO_HOME=/cargo_home \
@@ -25,24 +25,14 @@ RUN set -ex; \
     rm /tmp/*.sh
 
 RUN set -ex; \
-    rustup install --profile default nightly-2022-04-20; \
+    rustup toolchain install --profile default nightly-2022-04-20; \
     rustup target add wasm32-unknown-unknown; \
-    rustup component add rust-src --toolchain nightly-2022-04-20-x86_64-unknown-linux-gnu
+    rustup component add rust-src
 
 
-FROM rust-base as cargo-chef
-RUN cargo install cargo-chef
-
-FROM cargo-chef as planner
-WORKDIR /iroha
-COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
-
-FROM cargo-chef as builder
+FROM rust-base as builder
 ARG PROFILE
 WORKDIR /iroha
-COPY --from=planner /iroha/recipe.json recipe.json
-RUN cargo chef cook $PROFILE --recipe-path recipe.json
 COPY . .
 RUN cargo build $PROFILE --workspace
 

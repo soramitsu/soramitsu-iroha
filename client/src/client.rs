@@ -1,32 +1,31 @@
 //! Contains the end-point querying logic.  This is where you need to
 //! add any custom end-point related logic.
 use std::{
-    collections::HashMap,
-    fmt::{self, Debug, Formatter},
-    marker::PhantomData,
-    sync::mpsc,
-    thread,
-    time::Duration,
+    collections::HashMap, fmt::Debug, marker::PhantomData, sync::mpsc, thread, time::Duration,
 };
 
+use derive_more::{DebugCustom, Display};
 use eyre::{eyre, Result, WrapErr};
 use http_default::WebSocketStream;
 use iroha_config::{GetConfiguration, PostConfiguration};
 use iroha_core::smartcontracts::isi::query::Error as QueryError;
 use iroha_crypto::{HashOf, KeyPair};
-use iroha_data_model::{prelude::*, query::SignedQueryRequest};
+use iroha_data_model::{predicate::PredicateBox, prelude::*, query::SignedQueryRequest};
 use iroha_logger::prelude::*;
 use iroha_telemetry::metrics::Status;
 use iroha_version::prelude::*;
+use parity_scale_codec::DecodeAll;
 use rand::Rng;
 use serde::de::DeserializeOwned;
 use small::SmallStr;
 
 use crate::{
     config::Configuration,
-    http::{Headers as HttpHeaders, Method as HttpMethod, RequestBuilder, Response, StatusCode},
+    http::{Method as HttpMethod, RequestBuilder, Response, StatusCode},
     http_default::{self, DefaultRequestBuilder, WebSocketError, WebSocketMessage},
 };
+
+const APPLICATION_JSON: &str = "application/json";
 
 /// General trait for all response handlers
 pub trait ResponseHandler<T = Vec<u8>> {
@@ -64,15 +63,25 @@ where
             resp: &Response<Vec<u8>>,
         ) -> QueryHandlerResult<VersionedPaginatedQueryResult> {
             match resp.status() {
-                StatusCode::OK => VersionedPaginatedQueryResult::decode_versioned(resp.body())
-                    .wrap_err("Failed to decode response body as VersionedPaginatedQueryResult")
-                    .map_err(Into::into),
+                StatusCode::OK => {
+                    let res =
+                        try_decode_all_or_just_decode!(VersionedPaginatedQueryResult, resp.body());
+                    res.wrap_err(
+                        "Failed to decode the whole response body as `VersionedPaginatedQueryResult`",
+                    )
+                    .map_err(Into::into)
+                }
                 StatusCode::BAD_REQUEST
                 | StatusCode::UNAUTHORIZED
                 | StatusCode::FORBIDDEN
                 | StatusCode::NOT_FOUND => {
-                    let err = QueryError::decode(&mut resp.body().as_ref())
-                        .wrap_err("Failed to decode response body as QueryError")?;
+                    let mut res = QueryError::decode_all(resp.body().as_ref());
+                    if res.is_err() {
+                        warn!("Can't decode query error, not all bytes were consumed");
+                        res = QueryError::decode(&mut resp.body().as_ref());
+                    }
+                    let err =
+                        res.wrap_err("Failed to decode the whole response body as `QueryError`")?;
                     Err(ClientQueryError::QueryError(err))
                 }
                 _ => Err(ResponseReport::with_msg("Unexpected query response", resp).into()),
@@ -179,6 +188,8 @@ where
 {
     /// Query output
     pub output: R::Output,
+    /// The filter that was applied to the output.
+    pub filter: PredicateBox,
     /// See [`iroha_data_model::prelude::PaginatedQueryResult`]
     pub pagination: Pagination,
     /// See [`iroha_data_model::prelude::PaginatedQueryResult`]
@@ -208,6 +219,7 @@ where
             result,
             pagination,
             total,
+            filter,
         }: PaginatedQueryResult,
     ) -> Result<Self> {
         let QueryResult(result) = result;
@@ -219,12 +231,18 @@ where
             output,
             pagination,
             total,
+            filter,
         })
     }
 }
 
 /// Iroha client
-#[derive(Clone)]
+#[derive(Clone, DebugCustom, Display)]
+#[debug(
+    fmt = "Client {{ torii: {torii_url}, telemetry_url: {telemetry_url}, public_key: {} }}",
+    "key_pair.public_key()"
+)]
+#[display(fmt = "{}@{torii_url}", "key_pair.public_key()")]
 pub struct Client {
     /// Url for accessing iroha node
     torii_url: SmallStr,
@@ -241,7 +259,7 @@ pub struct Client {
     /// Current account
     account_id: AccountId,
     /// Http headers which will be appended to each request
-    headers: HttpHeaders,
+    headers: HashMap<String, String>,
     /// If `true` add nonce, which makes different hashes for
     /// transactions which occur repeatedly and/or simultaneously
     add_transaction_nonce: bool,
@@ -253,8 +271,9 @@ impl Client {
     ///
     /// # Errors
     /// If configuration isn't valid (e.g public/private keys don't match)
+    #[inline]
     pub fn new(configuration: &Configuration) -> Result<Self> {
-        Self::with_headers(configuration, HttpHeaders::default())
+        Self::with_headers(configuration, HashMap::new())
     }
 
     /// Constructor for client from configuration and headers
@@ -263,6 +282,7 @@ impl Client {
     ///
     /// # Errors
     /// If configuration isn't valid (e.g public/private keys don't match)
+    #[inline]
     pub fn with_headers(
         configuration: &Configuration,
         mut headers: HashMap<String, String>,
@@ -342,12 +362,12 @@ impl Client {
     ///
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
-    #[log]
     pub fn submit(
-        &mut self,
+        &self,
         instruction: impl Into<Instruction> + Debug,
     ) -> Result<HashOf<VersionedTransaction>> {
-        self.submit_all(vec![instruction.into()])
+        let isi = instruction.into();
+        self.submit_all([isi])
     }
 
     /// Instructions API entry point. Submits several Iroha Special Instructions to `Iroha` peers.
@@ -356,7 +376,7 @@ impl Client {
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
     pub fn submit_all(
-        &mut self,
+        &self,
         instructions: impl IntoIterator<Item = Instruction>,
     ) -> Result<HashOf<VersionedTransaction>> {
         self.submit_all_with_metadata(instructions, UnlimitedMetadata::new())
@@ -368,13 +388,12 @@ impl Client {
     ///
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
-    #[log]
     pub fn submit_with_metadata(
-        &mut self,
+        &self,
         instruction: Instruction,
         metadata: UnlimitedMetadata,
     ) -> Result<HashOf<VersionedTransaction>> {
-        self.submit_all_with_metadata(vec![instruction], metadata)
+        self.submit_all_with_metadata([instruction], metadata)
     }
 
     /// Instructions API entry point. Submits several Iroha Special Instructions to `Iroha` peers.
@@ -384,7 +403,7 @@ impl Client {
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
     pub fn submit_all_with_metadata(
-        &mut self,
+        &self,
         instructions: impl IntoIterator<Item = Instruction>,
         metadata: UnlimitedMetadata,
     ) -> Result<HashOf<VersionedTransaction>> {
@@ -400,9 +419,11 @@ impl Client {
         &self,
         transaction: Transaction,
     ) -> Result<HashOf<VersionedTransaction>> {
+        iroha_logger::trace!(tx=?transaction);
         let (req, hash, resp_handler) =
             self.prepare_transaction_request::<DefaultRequestBuilder>(transaction)?;
         let response = req
+            .build()?
             .send()
             .wrap_err_with(|| format!("Failed to send transaction with hash {:?}", hash))?;
         resp_handler.handle(response)?;
@@ -419,13 +440,10 @@ impl Client {
     ///
     /// # Errors
     /// Fails if transaction check fails
-    pub fn prepare_transaction_request<B>(
+    pub fn prepare_transaction_request<B: RequestBuilder>(
         &self,
         transaction: Transaction,
-    ) -> Result<(B, HashOf<VersionedTransaction>, TransactionResponseHandler)>
-    where
-        B: RequestBuilder,
-    {
+    ) -> Result<(B, HashOf<VersionedTransaction>, TransactionResponseHandler)> {
         transaction.check_limits(&self.transaction_limits)?;
         let transaction: VersionedTransaction = transaction.into();
         let hash = transaction.hash();
@@ -436,8 +454,8 @@ impl Client {
                 HttpMethod::POST,
                 format!("{}/{}", &self.torii_url, uri::TRANSACTION),
             )
-            .bytes(transaction_bytes)
-            .headers(self.headers.clone()),
+            .headers(self.headers.clone())
+            .body(transaction_bytes),
             hash,
             TransactionResponseHandler,
         ))
@@ -449,7 +467,7 @@ impl Client {
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
     pub fn submit_blocking(
-        &mut self,
+        &self,
         instruction: impl Into<Instruction>,
     ) -> Result<HashOf<VersionedTransaction>> {
         self.submit_all_blocking(vec![instruction.into()])
@@ -461,7 +479,7 @@ impl Client {
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
     pub fn submit_all_blocking(
-        &mut self,
+        &self,
         instructions: impl IntoIterator<Item = Instruction>,
     ) -> Result<HashOf<VersionedTransaction>> {
         self.submit_all_blocking_with_metadata(instructions, UnlimitedMetadata::new())
@@ -474,7 +492,7 @@ impl Client {
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
     pub fn submit_blocking_with_metadata(
-        &mut self,
+        &self,
         instruction: impl Into<Instruction>,
         metadata: UnlimitedMetadata,
     ) -> Result<HashOf<VersionedTransaction>> {
@@ -488,13 +506,13 @@ impl Client {
     /// # Errors
     /// Fails if sending transaction to peer fails or if it response with error
     pub fn submit_all_blocking_with_metadata(
-        &mut self,
+        &self,
         instructions: impl IntoIterator<Item = Instruction>,
         metadata: UnlimitedMetadata,
     ) -> Result<HashOf<VersionedTransaction>> {
         struct EventListenerInitialized;
 
-        let mut client = self.clone();
+        let client = self.clone();
         let (event_sender, event_receiver) = mpsc::channel();
         let (init_sender, init_receiver) = mpsc::channel();
         let transaction = self.build_transaction(instructions.into(), metadata)?;
@@ -582,6 +600,7 @@ impl Client {
         &self,
         request: R,
         pagination: Pagination,
+        filter: PredicateBox,
     ) -> Result<(B, QueryResponseHandler<R>)>
     where
         R: Query + Into<QueryBox> + Debug,
@@ -589,7 +608,7 @@ impl Client {
         B: RequestBuilder,
     {
         let pagination: Vec<_> = pagination.into();
-        let request = QueryRequest::new(request.into(), self.account_id.clone());
+        let request = QueryRequest::new(request.into(), self.account_id.clone(), filter);
         let request: VersionedSignedQueryRequest = self.sign_query(request)?.into();
 
         Ok((
@@ -597,21 +616,41 @@ impl Client {
                 HttpMethod::POST,
                 format!("{}/{}", &self.torii_url, uri::QUERY),
             )
-            .bytes(request.encode_versioned())
             .params(pagination)
-            .headers(self.headers.clone()),
+            .headers(self.headers.clone())
+            .body(request.encode_versioned()),
             QueryResponseHandler::default(),
         ))
+    }
+
+    /// Create a request with pagination and add the filter.
+    ///
+    /// # Errors
+    /// Forwards from [`Self::prepare_query_request`].
+    pub fn request_with_pagination_and_filter<R>(
+        &self,
+        request: R,
+        pagination: Pagination,
+        filter: PredicateBox,
+    ) -> QueryHandlerResult<ClientQueryOutput<R>>
+    where
+        R: Query + Into<QueryBox> + Debug,
+        <R::Output as TryFrom<Value>>::Error: Into<eyre::Error>, // Seems redundant
+    {
+        iroha_logger::trace!(?request, %pagination, ?filter);
+        let (req, resp_handler) =
+            self.prepare_query_request::<R, DefaultRequestBuilder>(request, pagination, filter)?;
+        let response = req.build()?.send()?;
+        resp_handler.handle(response)
     }
 
     /// Query API entry point. Requests queries from `Iroha` peers with pagination.
     ///
     /// Uses default blocking http-client. If you need some custom integration, look at
-    /// [`Self::prepare_query_request()`].
+    /// [`Self::prepare_query_request`].
     ///
     /// # Errors
     /// Fails if sending request fails
-    #[log]
     pub fn request_with_pagination<R>(
         &self,
         request: R,
@@ -621,17 +660,13 @@ impl Client {
         R: Query + Into<QueryBox> + Debug,
         <R::Output as TryFrom<Value>>::Error: Into<eyre::Error>,
     {
-        let (req, resp_handler) =
-            self.prepare_query_request::<R, DefaultRequestBuilder>(request, pagination)?;
-        let response = req.send()?;
-        resp_handler.handle(response)
+        self.request_with_pagination_and_filter(request, pagination, PredicateBox::default())
     }
 
     /// Query API entry point. Requests queries from `Iroha` peers.
     ///
     /// # Errors
     /// Fails if sending request fails
-    #[log]
     pub fn request<R>(&self, request: R) -> QueryHandlerResult<R::Output>
     where
         R: Query + Into<QueryBox> + Debug,
@@ -646,13 +681,23 @@ impl Client {
     /// # Errors
     /// Fails if subscribing to websocket fails
     pub fn listen_for_events(
-        &mut self,
+        &self,
         event_filter: FilterBox,
     ) -> Result<impl Iterator<Item = Result<Event>>> {
-        EventIterator::new(
-            &format!("{}/{}", &self.torii_url, uri::SUBSCRIPTION),
+        iroha_logger::trace!(?event_filter);
+        events_api::EventIterator::new(self.events_handler(event_filter)?)
+    }
+
+    /// Constructs an Events API handler. With it, you can use any WS client you want.
+    ///
+    /// # Errors
+    /// Fails if handler construction fails
+    #[inline]
+    pub fn events_handler(&self, event_filter: FilterBox) -> Result<events_api::flow::Init> {
+        events_api::flow::Init::new(
             event_filter,
             self.headers.clone(),
+            &format!("{}/{}", &self.torii_url, uri::SUBSCRIPTION),
         )
     }
 
@@ -677,11 +722,12 @@ impl Client {
             )
             .params(pagination.clone())
             .headers(self.headers.clone())
+            .build()?
             .send()?;
 
             if response.status() == StatusCode::OK {
                 let pending_transactions =
-                    VersionedPendingTransactions::decode_versioned(response.body())?;
+                    try_decode_all_or_just_decode!(VersionedPendingTransactions, response.body())?;
                 let VersionedPendingTransactions::V1(pending_transactions) = pending_transactions;
                 let transaction = pending_transactions
                     .into_iter()
@@ -725,15 +771,13 @@ impl Client {
     }
 
     fn get_config<T: DeserializeOwned>(&self, get_config: &GetConfiguration) -> Result<T> {
-        let headers = [("Content-Type".to_owned(), "application/json".to_owned())]
-            .into_iter()
-            .collect();
         let resp = DefaultRequestBuilder::new(
             HttpMethod::GET,
             format!("{}/{}", &self.torii_url, uri::CONFIGURATION),
         )
-        .bytes(serde_json::to_vec(get_config).wrap_err("Failed to serialize")?)
-        .headers(headers)
+        .header(http::header::CONTENT_TYPE, APPLICATION_JSON)
+        .body(serde_json::to_vec(get_config).wrap_err("Failed to serialize")?)
+        .build()?
         .send()?;
 
         if resp.status() != StatusCode::OK {
@@ -751,15 +795,13 @@ impl Client {
     /// # Errors
     /// If sending request or decoding fails
     pub fn set_config(&self, post_config: PostConfiguration) -> Result<bool> {
-        let headers = [("Content-type".to_owned(), "application/json".to_owned())]
-            .into_iter()
-            .collect();
         let body = serde_json::to_vec(&post_config)
             .wrap_err(format!("Failed to serialize {:?}", post_config))?;
         let url = &format!("{}/{}", self.torii_url, uri::CONFIGURATION);
         let resp = DefaultRequestBuilder::new(HttpMethod::POST, url)
-            .bytes(body)
-            .headers(headers)
+            .header(http::header::CONTENT_TYPE, APPLICATION_JSON)
+            .body(body)
+            .build()?
             .send()?;
 
         if resp.status() != StatusCode::OK {
@@ -793,15 +835,16 @@ impl Client {
     }
 
     /// Gets network status seen from the peer
+    ///
     /// # Errors
     /// Fails if sending request or decoding fails
     pub fn get_status(&self) -> Result<Status> {
         let (req, resp_handler) = self.prepare_status_request::<DefaultRequestBuilder>();
-        let resp = req.send()?;
+        let resp = req.build()?.send()?;
         resp_handler.handle(resp)
     }
 
-    /// Prepares http-request to implement [`Self::get_status()`] on your own.
+    /// Prepares http-request to implement [`Self::get_status`] on your own.
     ///
     /// For general usage example see [`Client::prepare_query_request`].
     ///
@@ -822,106 +865,193 @@ impl Client {
     }
 }
 
-/// Iterator for getting events from the `WebSocket` stream.
-#[derive(Debug)]
-pub struct EventIterator {
-    stream: WebSocketStream,
-}
+/// Logic related to Events API client implementation.
+pub mod events_api {
+    use super::*;
+    use crate::http::ws::{
+        conn_flow::{
+            EventData, Events as FlowEvents, Handshake as FlowHandshake, Init as FlowInit, InitData,
+        },
+        transform_ws_url,
+    };
 
-impl EventIterator {
-    /// Constructs `EventIterator` and sends the subscription request.
-    ///
-    /// # Errors
-    /// Fails if connecting and sending subscription to web socket fails
-    pub fn new(url: &str, event_filter: FilterBox, headers: HttpHeaders) -> Result<Self> {
-        let mut stream = http_default::web_socket_connect(url, headers)?;
-        stream.write_message(WebSocketMessage::Binary(
-            VersionedEventSubscriberMessage::from(EventSubscriberMessage::from(event_filter))
-                .encode_versioned(),
-        ))?;
-        loop {
-            match stream.read_message() {
-                Ok(WebSocketMessage::Binary(message)) => {
-                    if let EventPublisherMessage::SubscriptionAccepted =
-                        VersionedEventPublisherMessage::decode_versioned(&message)?.into_v1()
-                    {
-                        break;
+    /// Events API flow. For documentation and example usage please follow to [`crate::http::ws::conn_flow`].
+    pub mod flow {
+        use super::*;
+
+        /// Initialization struct for Events API flow.
+        pub struct Init {
+            /// Event filter
+            filter: FilterBox,
+            /// HTTP request headers
+            headers: HashMap<String, String>,
+            /// TORII URL
+            url: String,
+        }
+
+        impl Init {
+            /// Construct new item with provided filter, headers and url.
+            ///
+            /// # Errors
+            /// Fails if [`transform_ws_url`] fails.
+            #[inline]
+            pub(in super::super) fn new(
+                filter: FilterBox,
+                headers: HashMap<String, String>,
+                url: impl AsRef<str>,
+            ) -> Result<Self> {
+                Ok(Self {
+                    filter,
+                    headers,
+                    url: transform_ws_url(url.as_ref())?,
+                })
+            }
+        }
+
+        impl<R: RequestBuilder> FlowInit<R> for Init {
+            type Next = Handshake;
+
+            fn init(self) -> InitData<R, Self::Next> {
+                let Self {
+                    filter,
+                    headers,
+                    url,
+                } = self;
+
+                let msg =
+                    VersionedEventSubscriberMessage::from(EventSubscriberMessage::from(filter))
+                        .encode_versioned();
+
+                InitData::new(
+                    R::new(HttpMethod::GET, url).headers(headers),
+                    msg,
+                    Handshake,
+                )
+            }
+        }
+
+        /// Events API flow handshake handler
+        #[derive(Copy, Clone)]
+        pub struct Handshake;
+
+        impl FlowHandshake for Handshake {
+            type Next = Events;
+
+            fn message(self, message: Vec<u8>) -> Result<Self::Next>
+            where
+                Self::Next: FlowEvents,
+            {
+                if let EventPublisherMessage::SubscriptionAccepted =
+                    try_decode_all_or_just_decode!(VersionedEventPublisherMessage, &message)?
+                        .into_v1()
+                {
+                    return Ok(Events);
+                }
+                return Err(eyre!("Expected `SubscriptionAccepted`."));
+            }
+        }
+
+        /// Events API flow events handler
+        #[derive(Debug, Copy, Clone)]
+        pub struct Events;
+
+        impl FlowEvents for Events {
+            type Event = iroha_data_model::prelude::Event;
+
+            fn message(&self, message: Vec<u8>) -> Result<EventData<Self::Event>> {
+                let event_socket_message =
+                    try_decode_all_or_just_decode!(VersionedEventPublisherMessage, &message)?
+                        .into_v1();
+                let event = match event_socket_message {
+                    EventPublisherMessage::Event(event) => event,
+                    msg => return Err(eyre!("Expected Event but got {:?}", msg)),
+                };
+                let versioned_message =
+                    VersionedEventSubscriberMessage::from(EventSubscriberMessage::EventReceived)
+                        .encode_versioned();
+
+                Ok(EventData::new(event, versioned_message))
+            }
+        }
+    }
+
+    /// Iterator for getting events from the `WebSocket` stream.
+    #[derive(Debug)]
+    pub(super) struct EventIterator {
+        stream: WebSocketStream,
+        handler: flow::Events,
+    }
+
+    impl EventIterator {
+        /// Constructs `EventIterator` and sends the subscription request.
+        ///
+        /// # Errors
+        /// Fails if connecting and sending subscription to web socket fails
+        pub fn new(handler: flow::Init) -> Result<Self> {
+            let InitData {
+                first_message,
+                req,
+                next: handler,
+            } = FlowInit::<http_default::DefaultWebSocketRequestBuilder>::init(handler);
+
+            let mut stream = req.build()?.connect()?;
+            stream.write_message(WebSocketMessage::Binary(first_message))?;
+
+            let handler = loop {
+                match stream.read_message() {
+                    Ok(WebSocketMessage::Binary(message)) => break handler.message(message)?,
+                    Ok(_) => continue,
+                    Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
+                        return Err(eyre!("WebSocket connection closed."))
                     }
-                    return Err(eyre!("Expected `SubscriptionAccepted`."));
+                    Err(err) => return Err(err.into()),
                 }
-                Ok(_) => continue,
-                Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
-                    return Err(eyre!("WebSocket connection closed."))
-                }
-                Err(err) => return Err(err.into()),
-            }
+            };
+            Ok(Self { stream, handler })
         }
-        Ok(Self { stream })
     }
-}
 
-impl Iterator for EventIterator {
-    type Item = Result<Event>;
+    impl Iterator for EventIterator {
+        type Item = Result<Event>;
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.stream.read_message() {
-                Ok(WebSocketMessage::Binary(message)) => {
-                    let event_socket_message =
-                        match VersionedEventPublisherMessage::decode_versioned(&message) {
-                            Ok(event_socket_message) => event_socket_message.into_v1(),
-                            Err(err) => return Some(Err(err.into())),
-                        };
-                    let event = match event_socket_message {
-                        EventPublisherMessage::Event(event) => event,
-                        msg => return Some(Err(eyre!("Expected Event but got {:?}", msg))),
-                    };
-                    let versioned_message = VersionedEventSubscriberMessage::from(
-                        EventSubscriberMessage::EventReceived,
-                    )
-                    .encode_versioned();
-                    return match self
-                        .stream
-                        .write_message(WebSocketMessage::Binary(versioned_message))
-                    {
-                        Ok(_) => Some(Ok(event)),
-                        Err(err) => Some(Err(eyre!("Failed to send receipt: {}", err))),
-                    };
+        fn next(&mut self) -> Option<Self::Item> {
+            loop {
+                match self.stream.read_message() {
+                    Ok(WebSocketMessage::Binary(message)) => {
+                        return Some(self.handler.message(message).and_then(
+                            |EventData { reply, event }| {
+                                self.stream
+                                    .write_message(WebSocketMessage::Binary(reply))
+                                    .map(|_| event)
+                                    .wrap_err("Failed to reply")
+                            },
+                        ));
+                    }
+                    Ok(_) => continue,
+                    Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
+                        return None
+                    }
+                    Err(err) => return Some(Err(err.into())),
                 }
-                Ok(_) => continue,
-                Err(WebSocketError::ConnectionClosed | WebSocketError::AlreadyClosed) => {
-                    return None
-                }
-                Err(err) => return Some(Err(err.into())),
             }
         }
     }
-}
 
-impl Drop for EventIterator {
-    fn drop(&mut self) {
-        let mut close = || -> eyre::Result<()> {
-            self.stream.close(None)?;
-            let mes = self.stream.read_message()?;
-            if !mes.is_close() {
-                return Err(eyre!(
-                    "Server hasn't sent `Close` message for websocket handshake"
-                ));
-            }
-            Ok(())
-        };
+    impl Drop for EventIterator {
+        fn drop(&mut self) {
+            let mut close = || -> eyre::Result<()> {
+                self.stream.close(None)?;
+                let mes = self.stream.read_message()?;
+                if !mes.is_close() {
+                    return Err(eyre!(
+                        "Server hasn't sent `Close` message for websocket handshake"
+                    ));
+                }
+                Ok(())
+            };
 
-        let _ = close().map_err(|e| warn!(%e));
-    }
-}
-
-impl Debug for Client {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Client")
-            .field("public_key", self.key_pair.public_key())
-            .field("torii_url", &self.torii_url)
-            .field("telemetry_url", &self.telemetry_url)
-            .finish()
+            let _ = close().map_err(|e| warn!(%e));
+        }
     }
 }
 
@@ -961,6 +1091,13 @@ pub mod asset {
         FindAllAssetsDefinitions::new()
     }
 
+    /// Get query to get asset definition by its id
+    pub fn definition_by_id(
+        asset_definition_id: impl Into<EvaluatesTo<AssetDefinitionId>>,
+    ) -> FindAssetDefinitionById {
+        FindAssetDefinitionById::new(asset_definition_id)
+    }
+
     /// Get query to get all assets by account id
     pub fn by_account_id(account_id: impl Into<EvaluatesTo<AccountId>>) -> FindAssetsByAccountId {
         FindAssetsByAccountId::new(account_id)
@@ -993,6 +1130,11 @@ pub mod transaction {
 
     use super::*;
 
+    /// Get query to find all transactions
+    pub fn all() -> FindAllTransactions {
+        FindAllTransactions::new()
+    }
+
     /// Get query to retrieve transactions for account
     pub fn by_account_id(
         account_id: impl Into<EvaluatesTo<AccountId>>,
@@ -1003,6 +1145,41 @@ pub mod transaction {
     /// Get query to retrieve transaction by hash
     pub fn by_hash(hash: impl Into<EvaluatesTo<Hash>>) -> FindTransactionByHash {
         FindTransactionByHash::new(hash)
+    }
+}
+
+pub mod trigger {
+    //! Module with queries for triggers
+    use super::*;
+
+    /// Get query to get triggers by domain id
+    pub fn by_domain_id(domain_id: impl Into<EvaluatesTo<DomainId>>) -> FindTriggersByDomainId {
+        FindTriggersByDomainId::new(domain_id)
+    }
+}
+
+pub mod role {
+    //! Module with queries for roles
+    use super::*;
+
+    /// Get query to retrieve all roles
+    pub const fn all() -> FindAllRoles {
+        FindAllRoles::new()
+    }
+
+    /// Get query to retrieve all role ids
+    pub const fn all_ids() -> FindAllRoleIds {
+        FindAllRoleIds::new()
+    }
+
+    /// Get query to retrieve a role by its id
+    pub fn by_id(role_id: impl Into<EvaluatesTo<RoleId>>) -> FindRoleByRoleId {
+        FindRoleByRoleId::new(role_id)
+    }
+
+    /// Get query to retrieve all roles for an account
+    pub fn by_account_id(account_id: impl Into<EvaluatesTo<AccountId>>) -> FindRolesByAccountId {
+        FindRolesByAccountId::new(account_id)
     }
 }
 
@@ -1069,7 +1246,7 @@ mod tests {
     #[cfg(test)]
     mod query_errors_handling {
         use http::Response;
-        use iroha_core::smartcontracts::isi::query::UnsupportedVersionError;
+        use iroha_core::smartcontracts::permissions::error::DenialReason;
 
         use super::*;
 
@@ -1078,16 +1255,12 @@ mod tests {
             let sut = QueryResponseHandler::<FindAllAssets>::default();
             let responses = vec![
                 (
-                    StatusCode::BAD_REQUEST,
-                    QueryError::Version(UnsupportedVersionError { version: 19 }),
-                ),
-                (
                     StatusCode::UNAUTHORIZED,
                     QueryError::Signature("whatever".to_owned()),
                 ),
                 (
                     StatusCode::FORBIDDEN,
-                    QueryError::Permission("whatever".to_owned()),
+                    QueryError::Permission(DenialReason::Custom("whatever".to_owned())),
                 ),
                 (
                     StatusCode::NOT_FOUND,
@@ -1097,9 +1270,7 @@ mod tests {
             ];
 
             for (status_code, err) in responses {
-                let resp = Response::builder()
-                    .status(status_code)
-                    .body(err.clone().encode())?;
+                let resp = Response::builder().status(status_code).body(err.encode())?;
 
                 match sut.handle(resp) {
                     Err(ClientQueryError::QueryError(actual)) => {

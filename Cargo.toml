@@ -4,6 +4,7 @@ members = [
   "actor",
   "actor/derive",
   "cli",
+  "cli/derive",
   "client",
   "client_cli",
   "config",
@@ -16,6 +17,8 @@ members = [
   "tools/kagami",
   "data_model",
   "data_model/primitives",
+  "ffi",
+  "ffi/derive",
   "futures",
   "futures/derive",
   "logger",
@@ -31,3 +34,7 @@ members = [
   "version",
   "version/derive",
 ]
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

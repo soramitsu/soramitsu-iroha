@@ -10,11 +10,13 @@ use super::Configuration;
 
 #[test]
 fn connected_peers_with_f_2_1_2() {
+    prepare_test_for_nextest!();
     connected_peers_with_f(2)
 }
 
 #[test]
 fn connected_peers_with_f_1_0_1() {
+    prepare_test_for_nextest!();
     connected_peers_with_f(1)
 }
 
@@ -22,7 +24,7 @@ fn connected_peers_with_f_1_0_1() {
 fn connected_peers_with_f(faults: u64) {
     let n_peers = 3 * faults + 1;
 
-    let (_rt, network, mut genesis_client) = <Network>::start_test_with_runtime(n_peers as u32, 1);
+    let (_rt, network, genesis_client) = <Network>::start_test_with_runtime(n_peers as u32, 1);
     wait_for_genesis_committed(&network.clients(), 0);
     let pipeline_time = Configuration::pipeline_time();
 

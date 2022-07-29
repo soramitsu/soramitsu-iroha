@@ -4,13 +4,13 @@ use std::{str::FromStr as _, thread};
 
 use iroha_client::client::transaction;
 use iroha_data_model::prelude::*;
-use test_network::{Peer as TestPeer, *};
+use test_network::*;
 
 use super::Configuration;
 
 #[test]
 fn client_has_rejected_and_acepted_txs_should_return_tx_history() {
-    let (_rt, _peer, mut iroha_client) = <TestPeer>::start_test_with_runtime();
+    let (_rt, _peer, iroha_client) = <PeerBuilder>::new().start_with_runtime();
     wait_for_genesis_committed(&vec![iroha_client.clone()], 0);
 
     let pipeline_time = Configuration::pipeline_time();
@@ -18,8 +18,7 @@ fn client_has_rejected_and_acepted_txs_should_return_tx_history() {
     // Given
     let account_id = AccountId::from_str("alice@wonderland").expect("Valid");
     let asset_definition_id = AssetDefinitionId::from_str("xor#wonderland").expect("Valid");
-    let create_asset =
-        RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()).build());
+    let create_asset = RegisterBox::new(AssetDefinition::quantity(asset_definition_id.clone()));
     iroha_client
         .submit(create_asset)
         .expect("Failed to prepare state.");

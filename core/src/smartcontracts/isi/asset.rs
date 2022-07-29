@@ -1,7 +1,10 @@
 //! This module contains [`Asset`] structure, it's implementation and related traits and
 //! instructions implementations.
 
-use iroha_data_model::prelude::*;
+use iroha_data_model::{
+    prelude::*,
+    primitives::{CheckedOp, IntoMetric},
+};
 use iroha_telemetry::metrics;
 
 use super::prelude::*;
@@ -11,144 +14,16 @@ use super::prelude::*;
 /// - update metadata
 /// - transfer, etc.
 pub mod isi {
-    use iroha_data_model::{asset::Mintable, MintabilityError};
-    use iroha_logger::prelude::*;
-
     use super::*;
 
-    /// Asserts that asset definition with [`definition_id`] has asset type [`expected_value_type`].
-    fn assert_asset_type<W: WorldTrait>(
-        definition_id: &AssetDefinitionId,
-        wsv: &WorldStateView<W>,
-        expected_value_type: AssetValueType,
-    ) -> Result<AssetDefinition, Error> {
-        let asset_definition = wsv.asset_definition_entry(definition_id)?;
-        let definition = asset_definition.definition();
-
-        if *definition.value_type() == expected_value_type {
-            Ok(definition.clone())
-        } else {
-            Err(Error::Type(TypeError::Asset(AssetTypeError {
-                expected: expected_value_type,
-                got: *definition.value_type(),
-            })))
-        }
-    }
-
-    /// Assert that this asset is `mintable`.
-    fn assert_can_mint<W: WorldTrait>(
-        definition_id: &AssetDefinitionId,
-        wsv: &WorldStateView<W>,
-        expected_value_type: AssetValueType,
-    ) -> Result<(), Error> {
-        let definition = assert_asset_type(definition_id, wsv, expected_value_type)?;
-        match definition.mintable() {
-            Mintable::Infinitely => Ok(()),
-            Mintable::Not => Err(Error::Mintability(MintabilityError::MintUnmintable)),
-            Mintable::Once => {
-                wsv.modify_asset_definition_entry(definition_id, |entry| {
-                    entry.forbid_minting()?;
-                    Ok(AssetDefinitionEvent::MintabilityChanged(
-                        definition_id.clone(),
-                    ))
-                })?;
-                Ok(())
-            }
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for Mint<Asset, u32> {
-        type Error = Error;
-
-        #[metrics(+"mint_qty")]
-        fn execute(
-            self,
-            _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let asset_id = self.destination_id;
-
-            assert_can_mint(&asset_id.definition_id, wsv, AssetValueType::Quantity)?;
-            wsv.asset_or_insert(&asset_id, 0_u32)?;
-            wsv.modify_asset(&asset_id, |asset| {
-                let quantity: &mut u32 = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity
-                    .checked_add(self.object)
-                    .ok_or(Error::Math(MathError::Overflow))?;
-                wsv.metrics.tx_amounts.observe(f64::from(*quantity));
-
-                Ok(AssetEvent::Added(asset_id.clone()))
-            })
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for Mint<Asset, u128> {
-        type Error = Error;
-
-        #[metrics(+"mint_big_qty")]
-        #[log]
-        fn execute(
-            self,
-            authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let asset_id = self.destination_id;
-
-            assert_can_mint(&asset_id.definition_id, wsv, AssetValueType::BigQuantity)?;
-            wsv.asset_or_insert(&asset_id, 0_u128)?;
-            wsv.modify_asset(&asset_id, |asset| {
-                let quantity: &mut u128 = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity
-                    .checked_add(self.object)
-                    .ok_or(Error::Math(MathError::Overflow))?;
-                #[allow(clippy::cast_precision_loss)]
-                wsv.metrics.tx_amounts.observe(*quantity as f64);
-
-                Ok(AssetEvent::Added(asset_id.clone()))
-            })
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for Mint<Asset, Fixed> {
-        type Error = Error;
-
-        #[metrics(+"mint_fixed")]
-        fn execute(
-            self,
-            _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let asset_id = self.destination_id;
-
-            assert_can_mint(&asset_id.definition_id, wsv, AssetValueType::Fixed)?;
-            wsv.asset_or_insert(&asset_id, Fixed::ZERO)?;
-            wsv.modify_asset(&asset_id, |asset| {
-                let quantity: &mut Fixed = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity.checked_add(self.object)?;
-                wsv.metrics.tx_amounts.observe((*quantity).into());
-
-                Ok(AssetEvent::Added(asset_id.clone()))
-            })
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for SetKeyValue<Asset, Name, Value> {
+    impl Execute for SetKeyValue<Asset, Name, Value> {
         type Error = Error;
 
         #[metrics(+"asset_set_key_value")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let asset_id = self.object_id;
 
@@ -168,95 +43,14 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Burn<Asset, u32> {
-        type Error = Error;
-
-        #[metrics(+"burn_qty")]
-        fn execute(
-            self,
-            _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let asset_id = self.destination_id;
-
-            assert_asset_type(&asset_id.definition_id, wsv, AssetValueType::Quantity)?;
-            wsv.modify_asset(&asset_id, |asset| {
-                let quantity: &mut u32 = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity
-                    .checked_sub(self.object)
-                    .ok_or(MathError::NotEnoughQuantity)?;
-                wsv.metrics.tx_amounts.observe(f64::from(*quantity));
-
-                Ok(AssetEvent::Removed(asset_id.clone()))
-            })
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for Burn<Asset, u128> {
-        type Error = Error;
-
-        #[metrics(+"burn_big_qty")]
-        fn execute(
-            self,
-            _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let asset_id = self.destination_id;
-
-            assert_asset_type(&asset_id.definition_id, wsv, AssetValueType::BigQuantity)?;
-            wsv.modify_asset(&asset_id, |asset| {
-                let quantity: &mut u128 = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity
-                    .checked_sub(self.object)
-                    .ok_or(MathError::NotEnoughQuantity)?;
-                #[allow(clippy::cast_precision_loss)]
-                wsv.metrics.tx_amounts.observe(*quantity as f64);
-
-                Ok(AssetEvent::Removed(asset_id.clone()))
-            })
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for Burn<Asset, Fixed> {
-        type Error = Error;
-
-        #[metrics(+"burn_fixed")]
-        fn execute(
-            self,
-            _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let asset_id = self.destination_id;
-
-            assert_asset_type(&asset_id.definition_id, wsv, AssetValueType::Fixed)?;
-            wsv.modify_asset(&asset_id, |asset| {
-                let quantity: &mut Fixed = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity.checked_sub(self.object)?;
-                // Careful if `Fixed` stops being `Copy`.
-                wsv.metrics.tx_amounts.observe((*quantity).into());
-
-                Ok(AssetEvent::Removed(asset_id.clone()))
-            })
-        }
-    }
-
-    impl<W: WorldTrait> Execute<W> for RemoveKeyValue<Asset, Name> {
+    impl Execute for RemoveKeyValue<Asset, Name> {
         type Error = Error;
 
         #[metrics(+"asset_remove_key_value")]
         fn execute(
             self,
             _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
+            wsv: &WorldStateView,
         ) -> Result<(), Self::Error> {
             let asset_id = self.object_id;
 
@@ -275,84 +69,300 @@ pub mod isi {
         }
     }
 
-    impl<W: WorldTrait> Execute<W> for Transfer<Asset, u32, Asset> {
-        type Error = Error;
+    macro_rules! impl_mint {
+        ($ty:ty, $metrics:literal) => {
+            impl InnerMint for $ty {}
 
-        #[log(skip(_authority))]
-        #[metrics(+"transfer_qty_asset")]
-        fn execute(
-            self,
-            _authority: <Account as Identifiable>::Id,
-            wsv: &WorldStateView<W>,
-        ) -> Result<(), Self::Error> {
-            let source_asset_id = self.source_id;
-            let destination_asset_id = self.destination_id;
+            impl Execute for Mint<Asset, $ty> {
+                type Error = Error;
 
-            if destination_asset_id.definition_id != source_asset_id.definition_id {
-                let expected = *wsv
-                    .asset_definition_entry(&destination_asset_id.definition_id)?
-                    .definition()
-                    .value_type();
-                let got = *wsv
-                    .asset_definition_entry(&source_asset_id.definition_id)?
-                    .definition()
-                    .value_type();
-                return Err(Error::Type(TypeError::Asset(AssetTypeError {
-                    expected,
-                    got,
-                })));
+                #[metrics(+$metrics)]
+                fn execute(
+                    self,
+                    authority: AccountId,
+                    wsv: &WorldStateView,
+                ) -> Result<(), Self::Error> {
+                    <$ty as InnerMint>::execute(self, authority, wsv)
+                }
             }
-            assert_asset_type(
-                &source_asset_id.definition_id,
-                wsv,
-                AssetValueType::Quantity,
-            )?;
-            assert_asset_type(
-                &destination_asset_id.definition_id,
-                wsv,
-                AssetValueType::Quantity,
-            )?;
+        };
+    }
 
-            wsv.asset_or_insert(&destination_asset_id, 0_u32)?;
-            wsv.modify_asset(&source_asset_id, |asset| {
-                let quantity: &mut u32 = asset
+    macro_rules! impl_burn {
+        ($ty:ty, $metrics:literal) => {
+            impl InnerBurn for $ty {}
+
+            impl Execute for Burn<Asset, $ty> {
+                type Error = Error;
+
+                #[metrics(+$metrics)]
+                fn execute(
+                    self,
+                    authority: AccountId,
+                    wsv: &WorldStateView,
+                ) -> Result<(), Self::Error> {
+                    <$ty as InnerBurn>::execute(self, authority, wsv)
+                }
+            }
+        };
+    }
+
+    macro_rules! impl_transfer {
+        ($ty:ty, $metrics:literal) => {
+            impl InnerTransfer for $ty {}
+
+            impl Execute for Transfer<Asset, $ty, Asset> {
+                type Error = Error;
+
+                #[metrics(+$metrics)]
+                fn execute(
+                    self,
+                    authority: AccountId,
+                    wsv: &WorldStateView,
+                ) -> Result<(), Self::Error> {
+                    <$ty as InnerTransfer>::execute(self, authority, wsv)
+                }
+            }
+        };
+    }
+
+    impl_mint!(u32, "mint_qty");
+    impl_mint!(u128, "mint_big_qty");
+    impl_mint!(Fixed, "mint_fixed");
+
+    impl_burn!(u32, "burn_qty");
+    impl_burn!(u128, "burn_big_qty");
+    impl_burn!(Fixed, "burn_fixed");
+
+    impl_transfer!(u32, "transfer_qty");
+    impl_transfer!(u128, "transfer_big_qty");
+    impl_transfer!(Fixed, "transfer_fixed");
+
+    /// Trait for blanket mint implementation.
+    trait InnerMint {
+        fn execute<Err>(
+            mint: Mint<Asset, Self>,
+            _authority: <Account as Identifiable>::Id,
+            wsv: &WorldStateView,
+        ) -> Result<(), Err>
+        where
+            Self: AssetInstructionInfo + CheckedOp + IntoMetric + Copy,
+            AssetValue: From<Self> + TryAsMut<Self>,
+            Value: From<Self>,
+            <AssetValue as TryAsMut<Self>>::Error: std::error::Error + Send + Sync + 'static,
+            Err: From<Error>,
+        {
+            let asset_id = mint.destination_id;
+
+            assert_can_mint(
+                &asset_id.definition_id,
+                wsv,
+                <Self as AssetInstructionInfo>::EXPECTED_VALUE_TYPE,
+            )?;
+            wsv.asset_or_insert(
+                &asset_id,
+                <Self as AssetInstructionInfo>::DEFAULT_ASSET_VALUE,
+            )?;
+            wsv.modify_asset(&asset_id, |asset| {
+                let quantity: &mut Self = asset
                     .try_as_mut()
                     .map_err(eyre::Error::from)
                     .map_err(|e| Error::Conversion(e.to_string()))?;
                 *quantity = quantity
-                    .checked_sub(self.object)
-                    .ok_or(Error::Math(MathError::NotEnoughQuantity))?;
-
-                Ok(AssetEvent::Removed(source_asset_id.clone()))
-            })?;
-            wsv.modify_asset(&destination_asset_id, |asset| {
-                let quantity: &mut u32 = asset
-                    .try_as_mut()
-                    .map_err(eyre::Error::from)
-                    .map_err(|e| Error::Conversion(e.to_string()))?;
-                *quantity = quantity
-                    .checked_add(self.object)
+                    .checked_add(mint.object)
                     .ok_or(MathError::Overflow)?;
-                wsv.metrics.tx_amounts.observe(f64::from(*quantity));
+                wsv.metrics.tx_amounts.observe((*quantity).into_metric());
 
-                Ok(AssetEvent::Added(destination_asset_id.clone()))
-            })
+                Ok(AssetEvent::Added(asset_id.clone()))
+            })?;
+            Ok(())
         }
+    }
+
+    /// Trait for blanket burn implementation.
+    trait InnerBurn {
+        fn execute<Err>(
+            burn: Burn<Asset, Self>,
+            _authority: <Account as Identifiable>::Id,
+            wsv: &WorldStateView,
+        ) -> Result<(), Err>
+        where
+            Self: AssetInstructionInfo + CheckedOp + IntoMetric + Copy,
+            AssetValue: From<Self> + TryAsMut<Self>,
+            Value: From<Self>,
+            <AssetValue as TryAsMut<Self>>::Error: std::error::Error + Send + Sync + 'static,
+            Err: From<Error>,
+        {
+            let asset_id = burn.destination_id;
+
+            assert_asset_type(
+                &asset_id.definition_id,
+                wsv,
+                <Self as AssetInstructionInfo>::EXPECTED_VALUE_TYPE,
+            )?;
+            wsv.modify_asset(&asset_id, |asset| {
+                let quantity: &mut Self = asset
+                    .try_as_mut()
+                    .map_err(eyre::Error::from)
+                    .map_err(|e| Error::Conversion(e.to_string()))?;
+                *quantity = quantity
+                    .checked_sub(burn.object)
+                    .ok_or(MathError::NotEnoughQuantity)?;
+                wsv.metrics.tx_amounts.observe((*quantity).into_metric());
+
+                Ok(AssetEvent::Removed(asset_id.clone()))
+            })?;
+            Ok(())
+        }
+    }
+
+    /// Trait for blanket transfer implementation.
+    trait InnerTransfer {
+        fn execute<Err>(
+            transfer: Transfer<Asset, Self, Asset>,
+            _authority: <Account as Identifiable>::Id,
+            wsv: &WorldStateView,
+        ) -> Result<(), Err>
+        where
+            Self: AssetInstructionInfo + CheckedOp + IntoMetric + Copy,
+            AssetValue: From<Self> + TryAsMut<Self>,
+            Value: From<Self>,
+            <AssetValue as TryAsMut<Self>>::Error: std::error::Error + Send + Sync + 'static,
+            Err: From<Error>,
+        {
+            assert_matching_definitions(
+                &transfer.source_id,
+                &transfer.destination_id,
+                wsv,
+                <Self as AssetInstructionInfo>::EXPECTED_VALUE_TYPE,
+            )?;
+
+            wsv.asset_or_insert(
+                &transfer.destination_id,
+                <Self as AssetInstructionInfo>::DEFAULT_ASSET_VALUE,
+            )?;
+            wsv.modify_asset(&transfer.source_id, |asset| {
+                let quantity: &mut Self = asset
+                    .try_as_mut()
+                    .map_err(eyre::Error::from)
+                    .map_err(|e| Error::Conversion(e.to_string()))?;
+                *quantity = quantity
+                    .checked_sub(transfer.object)
+                    .ok_or(MathError::NotEnoughQuantity)?;
+
+                Ok(AssetEvent::Removed(transfer.source_id.clone()))
+            })?;
+            wsv.modify_asset(&transfer.destination_id, |asset| {
+                let quantity: &mut Self = asset
+                    .try_as_mut()
+                    .map_err(eyre::Error::from)
+                    .map_err(|e| Error::Conversion(e.to_string()))?;
+                *quantity = quantity
+                    .checked_add(transfer.object)
+                    .ok_or(MathError::Overflow)?;
+                wsv.metrics.tx_amounts.observe((*quantity).into_metric());
+
+                Ok(AssetEvent::Added(transfer.destination_id.clone()))
+            })?;
+            Ok(())
+        }
+    }
+
+    /// Trait for collecting fields associated with asset isi instructions:
+    /// - asset value type
+    /// - default asset value
+    trait AssetInstructionInfo {
+        const EXPECTED_VALUE_TYPE: AssetValueType;
+        const DEFAULT_ASSET_VALUE: Self;
+    }
+
+    macro_rules! impl_asset_instruction_info {
+        ($ty:ty, $expected_value_type:expr, $default_value:expr) => {
+            impl AssetInstructionInfo for $ty {
+                const EXPECTED_VALUE_TYPE: AssetValueType = $expected_value_type;
+                const DEFAULT_ASSET_VALUE: Self = $default_value;
+            }
+        };
+    }
+
+    impl_asset_instruction_info!(u32, AssetValueType::Quantity, 0_u32);
+    impl_asset_instruction_info!(u128, AssetValueType::BigQuantity, 0_u128);
+    impl_asset_instruction_info!(Fixed, AssetValueType::Fixed, Fixed::ZERO);
+
+    /// Asserts that asset definition with [`definition_id`] has asset type [`expected_value_type`].
+    pub(crate) fn assert_asset_type(
+        definition_id: &AssetDefinitionId,
+        wsv: &WorldStateView,
+        expected_value_type: AssetValueType,
+    ) -> Result<AssetDefinition, Error> {
+        let asset_definition = wsv.asset_definition_entry(definition_id)?;
+        let definition = asset_definition.definition();
+        if *definition.value_type() == expected_value_type {
+            Ok(definition.clone())
+        } else {
+            Err(TypeError::from(Mismatch {
+                expected: expected_value_type,
+                actual: *definition.value_type(),
+            })
+            .into())
+        }
+    }
+
+    /// Assert that this asset is `mintable`.
+    fn assert_can_mint(
+        definition_id: &AssetDefinitionId,
+        wsv: &WorldStateView,
+        expected_value_type: AssetValueType,
+    ) -> Result<(), Error> {
+        let definition = assert_asset_type(definition_id, wsv, expected_value_type)?;
+        match definition.mintable() {
+            Mintable::Infinitely => Ok(()),
+            Mintable::Not => Err(Error::Mintability(MintabilityError::MintUnmintable)),
+            Mintable::Once => wsv.modify_asset_definition_entry(definition_id, |entry| {
+                entry.forbid_minting()?;
+                Ok(AssetDefinitionEvent::MintabilityChanged(
+                    definition_id.clone(),
+                ))
+            }),
+        }
+    }
+
+    /// Assert that the two assets have the same asset `definition_id`.
+    fn assert_matching_definitions(
+        source: &<Asset as Identifiable>::Id,
+        destination: &<Asset as Identifiable>::Id,
+        wsv: &WorldStateView,
+        value_type: AssetValueType,
+    ) -> Result<(), Error> {
+        if destination.definition_id != source.definition_id {
+            let expected = wsv
+                .asset_definition_entry(&destination.definition_id)?
+                .definition()
+                .id()
+                .clone();
+            let actual = wsv
+                .asset_definition_entry(&source.definition_id)?
+                .definition()
+                .id()
+                .clone();
+            return Err(TypeError::from(Box::new(Mismatch { expected, actual })).into());
+        }
+        assert_asset_type(&source.definition_id, wsv, value_type)?;
+        assert_asset_type(&destination.definition_id, wsv, value_type)?;
+        Ok(())
     }
 }
 
 /// Asset-related query implementations.
 pub mod query {
     use eyre::{Result, WrapErr as _};
-    use iroha_logger::prelude::*;
 
     use super::*;
     use crate::smartcontracts::query::Error;
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAllAssets {
-        #[log]
+    impl ValidQuery for FindAllAssets {
         #[metrics(+"find_all_assets")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let mut vec = Vec::new();
             for domain in wsv.domains().iter() {
                 for account in domain.accounts() {
@@ -365,10 +375,9 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAllAssetsDefinitions {
-        #[log]
+    impl ValidQuery for FindAllAssetsDefinitions {
         #[metrics(+"find_all_asset_definitions")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let mut vec = Vec::new();
             for domain in wsv.domains().iter() {
                 for asset_definition_entry in domain.asset_definitions() {
@@ -379,15 +388,15 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetById {
-        #[log]
+    impl ValidQuery for FindAssetById {
         #[metrics(+"find_asset_by_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get asset id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             wsv.asset(&id)
                 .map_err(
                     |asset_err| match wsv.asset_definition_entry(&id.definition_id) {
@@ -399,15 +408,30 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetsByName {
-        #[log]
+    impl ValidQuery for FindAssetDefinitionById {
+        #[metrics(+"find_asset_defintion_by_id")]
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
+            let id = self
+                .id
+                .evaluate(wsv, &Context::default())
+                .wrap_err("Failed to get asset definition id")
+                .map_err(|e| Error::Evaluate(e.to_string()))?;
+
+            let entry = wsv.asset_definition_entry(&id).map_err(Error::from)?;
+
+            Ok(entry.definition().clone())
+        }
+    }
+
+    impl ValidQuery for FindAssetsByName {
         #[metrics(+"find_assets_by_name")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let name = self
                 .name
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get asset name")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%name);
             let mut vec = Vec::new();
             for domain in wsv.domains().iter() {
                 for account in domain.accounts() {
@@ -422,28 +446,28 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetsByAccountId {
-        #[log]
+    impl ValidQuery for FindAssetsByAccountId {
         #[metrics(+"find_assets_by_account_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .account_id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get account id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             wsv.account_assets(&id).map_err(Into::into)
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetsByAssetDefinitionId {
-        #[log]
+    impl ValidQuery for FindAssetsByAssetDefinitionId {
         #[metrics(+"find_assets_by_asset_definition_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .asset_definition_id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get asset definition id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             let mut vec = Vec::new();
             for domain in wsv.domains().iter() {
                 for account in domain.accounts() {
@@ -458,15 +482,15 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetsByDomainId {
-        #[log]
+    impl ValidQuery for FindAssetsByDomainId {
         #[metrics(+"find_assets_by_domain_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .domain_id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get domain id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             let mut vec = Vec::new();
             for account in wsv.domain(&id)?.accounts() {
                 for asset in account.assets() {
@@ -477,10 +501,9 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetsByDomainIdAndAssetDefinitionId {
-        #[log]
+    impl ValidQuery for FindAssetsByDomainIdAndAssetDefinitionId {
         #[metrics(+"find_assets_by_domain_id_and_asset_definition_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let domain_id = self
                 .domain_id
                 .evaluate(wsv, &Context::default())
@@ -495,6 +518,7 @@ pub mod query {
             let _definition = domain
                 .asset_definition(&asset_definition_id)
                 .ok_or_else(|| FindError::AssetDefinition(asset_definition_id.clone()))?;
+            iroha_logger::trace!(%domain_id, %asset_definition_id);
             let mut assets = Vec::new();
             for account in domain.accounts() {
                 for asset in account.assets() {
@@ -509,15 +533,15 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetQuantityById {
-        #[log]
+    impl ValidQuery for FindAssetQuantityById {
         #[metrics(+"find_asset_quantity_by_id")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .id
                 .evaluate(wsv, &Context::default())
                 .wrap_err("Failed to get asset id")
                 .map_err(|e| Error::Evaluate(e.to_string()))?;
+            iroha_logger::trace!(%id);
             wsv.asset(&id)
                 .map_err(
                     |asset_err| match wsv.asset_definition_entry(&id.definition_id) {
@@ -533,10 +557,9 @@ pub mod query {
         }
     }
 
-    impl<W: WorldTrait> ValidQuery<W> for FindAssetKeyValueByIdAndKey {
-        #[log]
+    impl ValidQuery for FindAssetKeyValueByIdAndKey {
         #[metrics(+"find_asset_key_value_by_id_and_key")]
-        fn execute(&self, wsv: &WorldStateView<W>) -> Result<Self::Output, Error> {
+        fn execute(&self, wsv: &WorldStateView) -> Result<Self::Output, Error> {
             let id = self
                 .id
                 .evaluate(wsv, &Context::default())
@@ -553,6 +576,7 @@ pub mod query {
                     Err(definition_err) => definition_err,
                 }
             })?;
+            iroha_logger::trace!(%id, %key);
             let store: &Metadata = asset
                 .value()
                 .try_as_ref()

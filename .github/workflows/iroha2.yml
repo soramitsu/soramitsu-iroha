@@ -8,38 +8,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  coverage:
-    runs-on: ubuntu-latest
-    container:
-      image: 7272721/i2-ci:latest
-    steps:
-      # TODO Remove this step #2165
-      - name: Add component
-        run: rustup component add llvm-tools-preview
-
-      - uses: actions/checkout@v2
-      - uses: Swatinem/rust-cache@v1
-      - name: Run tests
-        run: |
-          mold --run cargo test \
-          --quiet --workspace --no-fail-fast -- \
-          --skip unstable_network --skip ui --test-threads 3
-        env:
-          RUSTFLAGS: "-C instrument-coverage"
-          LLVM_PROFILE_FILE: "iroha-%p-%m.profraw"
-      - name: Generate a grcov coverage report
-        run: |
-          grcov . --binary-path ./target/debug/ -s . -t lcov --branch --ignore-not-existing --ignore "/*" -o lcov.info
-        if: always()
-      - name: Upload coverage to codecov.io
-        uses: codecov/codecov-action@v2
-        if: always()
-        with:
-          file: lcov.info
-
-
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux]
     container:
       image: 7272721/i2-ci:latest
     steps:

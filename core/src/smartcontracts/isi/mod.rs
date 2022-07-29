@@ -1,7 +1,9 @@
-//! This module contains enumeration of all possible Iroha Special Instructions `Instruction`,
-//! generic instruction types and related implementations.
+//! This module contains enumeration of all possible Iroha Special
+//! Instructions `Instruction`, generic instruction types and related
+//! implementations.
 pub mod account;
 pub mod asset;
+pub mod block;
 pub mod domain;
 pub mod expression;
 pub mod permissions;
@@ -16,10 +18,7 @@ use iroha_data_model::{expression::prelude::*, isi::*, prelude::*};
 use iroha_logger::prelude::*;
 
 use super::{Evaluate, Execute};
-use crate::{
-    prelude::*,
-    wsv::{WorldStateView, WorldTrait},
-};
+use crate::{prelude::*, wsv::WorldStateView};
 
 pub mod error {
     //! Errors used in Iroha special instructions and
@@ -28,15 +27,10 @@ pub mod error {
     //! [`eyre::Report`]. If it is impossible to predict what kind of
     //! error shall be raised, there are types that wrap
     //! [`eyre::Report`].
-    use std::{
-        error::Error as StdError,
-        fmt::{Display, Formatter},
-    };
 
+    use derive_more::Display;
     use iroha_crypto::HashOf;
-    use iroha_data_model::{
-        fixed::FixedPointOperationError, metadata, prelude::*, MintabilityError,
-    };
+    use iroha_data_model::{fixed::FixedPointOperationError, metadata, prelude::*, trigger};
     use iroha_schema::IntoSchema;
     use parity_scale_codec::{Decode, Encode};
     use thiserror::Error;
@@ -47,23 +41,23 @@ pub mod error {
     #[derive(Debug, Error)]
     pub enum Error {
         /// Failed to find some entity
-        #[error("Failed to find")]
-        Find(#[source] Box<FindError>),
+        #[error("Failed to find. {0}")]
+        Find(#[from] Box<FindError>),
         /// Failed to assert type
-        #[error("Failed to assert type")]
-        Type(#[source] TypeError),
+        #[error("Type assertion failed. {0}")]
+        Type(#[from] TypeError),
         /// Failed to assert mintability
         #[error("Mintability violation. {0}")]
         Mintability(#[from] MintabilityError),
         /// Failed due to math exception
         #[error("Math error. {0}")]
-        Math(#[source] MathError),
+        Math(#[from] MathError),
         /// Query Error
         #[error("Query failed. {0}")]
-        Query(#[source] query::Error),
+        Query(#[from] query::Error),
         /// Metadata Error.
         #[error("Metadata error: {0}")]
-        Metadata(#[source] metadata::Error),
+        Metadata(#[from] metadata::Error),
         /// Unsupported instruction.
         #[error("Unsupported {0} instruction")]
         Unsupported(InstructionType),
@@ -81,31 +75,25 @@ pub mod error {
         Validate(#[from] ValidationError),
     }
 
-    // The main reason these are needed is because `FromVariant` can
-    // create conflicting implementations if two nodes of the tree of
-    // error types have the same type. For example, if query::Error
-    // and Error::Validate both have `eyre::Report` the
-    // implementations for both will clash.
-    impl From<metadata::Error> for Error {
-        fn from(err: metadata::Error) -> Self {
-            Self::Metadata(err)
-        }
-    }
-
     impl From<FindError> for Error {
         fn from(err: FindError) -> Self {
             Self::Find(Box::new(err))
         }
     }
 
-    impl From<query::Error> for Error {
-        fn from(err: query::Error) -> Self {
-            Self::Query(err)
+    impl From<trigger::set::ModRepeatsError> for Error {
+        fn from(err: trigger::set::ModRepeatsError) -> Self {
+            match err {
+                trigger::set::ModRepeatsError::NotFound(not_found_id) => {
+                    FindError::Trigger(not_found_id).into()
+                }
+                trigger::set::ModRepeatsError::RepeatsOverflow(_) => MathError::Overflow.into(),
+            }
         }
     }
 
     /// Enumeration of instructions which can have unsupported variants.
-    #[derive(Debug, Clone, Copy)]
+    #[derive(Debug, Display, Clone, Copy)]
     pub enum InstructionType {
         /// Mint
         Mint,
@@ -127,14 +115,8 @@ pub mod error {
         Revoke,
     }
 
-    impl std::fmt::Display for InstructionType {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            std::fmt::Debug::fmt(self, f)
-        }
-    }
-
     /// Type assertion error
-    #[derive(Debug, Clone, Error, Decode, Encode, IntoSchema)]
+    #[derive(Debug, Error, Decode, Encode, IntoSchema)]
     pub enum FindError {
         /// Failed to find asset
         #[error("Failed to find asset: `{0}`")]
@@ -144,7 +126,7 @@ pub mod error {
         AssetDefinition(AssetDefinitionId),
         /// Failed to find account
         #[error("Failed to find account: `{0}`")]
-        Account(AccountId),
+        Account(<Account as Identifiable>::Id),
         /// Failed to find domain
         #[error("Failed to find domain: `{0}`")]
         Domain(DomainId),
@@ -152,8 +134,8 @@ pub mod error {
         #[error("Failed to find metadata key")]
         MetadataKey(Name),
         /// Block with supplied parent hash not found. More description in a string.
-        #[error("Block not found")]
-        Block(#[source] ParentHashNotFound),
+        #[error("Block with hash {0} not found.")]
+        Block(HashOf<VersionedCommittedBlock>),
         /// Transaction with given hash not found.
         #[error("Transaction not found")]
         Transaction(HashOf<VersionedTransaction>),
@@ -171,47 +153,29 @@ pub mod error {
         Role(RoleId),
     }
 
-    /// Type assertion error
-    #[derive(Debug, Clone, Error, Copy, PartialEq, Eq)]
+    /// Generic structure used to represent a mismatch
+    #[derive(Debug, Clone, PartialEq, Eq, Error, Decode, Encode, IntoSchema)]
+    #[error("Expected {expected:?}, actual {actual:?}")]
+    pub struct Mismatch<T> {
+        /// The value that is needed for normal execution
+        pub expected: T,
+        /// The value that caused the error
+        pub actual: T,
+    }
+
+    /// Type error
+    #[derive(Debug, Clone, Error, PartialEq, Eq)]
+    #[allow(variant_size_differences)] // False-positive
     pub enum TypeError {
         /// Asset type assertion error
-        #[error("Failed to assert type of asset")]
-        Asset(#[source] AssetTypeError),
+        #[error("Asset Ids correspond to assets with different underlying types. {0}")]
+        UnderlyingType(#[from] Mismatch<AssetValueType>),
+        /// Asset Id mismatch
+        #[error("Asset Ids don't match. {0}")]
+        DefinitionId(#[from] Box<Mismatch<<AssetDefinition as Identifiable>::Id>>),
     }
 
-    impl From<AssetTypeError> for TypeError {
-        fn from(err: AssetTypeError) -> Self {
-            Self::Asset(err)
-        }
-    }
-
-    /// Asset type assertion error
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct AssetTypeError {
-        /// Expected type
-        pub expected: AssetValueType,
-        /// Type which was discovered
-        pub got: AssetValueType,
-    }
-
-    impl Display for AssetTypeError {
-        #[allow(clippy::use_debug)]
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(
-                f,
-                "Asset type error: expected asset of type {:?}, but got {:?}",
-                self.expected, self.got
-            )
-        }
-    }
-
-    impl StdError for AssetTypeError {
-        fn source(&self) -> Option<&(dyn StdError + 'static)> {
-            None
-        }
-    }
-
-    /// Math error type inside instruction
+    /// Math error, which occurs during instruction execution
     #[derive(Debug, Clone, Error, Copy, PartialEq, Eq)]
     pub enum MathError {
         /// Overflow error inside instruction
@@ -241,40 +205,22 @@ pub mod error {
                 FixedPointOperationError::Conversion(e) => {
                     Self::Conversion(format!("Mathematical conversion failed. {}", e))
                 }
-                FixedPointOperationError::Overflow => Self::Math(MathError::Overflow),
-                FixedPointOperationError::DivideByZero => Self::Math(MathError::DivideByZero),
-                FixedPointOperationError::DomainViolation => Self::Math(MathError::DomainViolation),
-                FixedPointOperationError::Arithmetic => Self::Math(MathError::Unknown),
+                FixedPointOperationError::Overflow => MathError::Overflow.into(),
+                FixedPointOperationError::DivideByZero => MathError::DivideByZero.into(),
+                FixedPointOperationError::DomainViolation => MathError::DomainViolation.into(),
+                FixedPointOperationError::Arithmetic => MathError::Unknown.into(),
             }
         }
     }
-
-    impl From<MathError> for Error {
-        fn from(err: MathError) -> Self {
-            Self::Math(err)
-        }
-    }
-
-    /// Block with parent hash not found struct
-    #[derive(Debug, Clone, Copy, Decode, Encode, IntoSchema)]
-    pub struct ParentHashNotFound(pub HashOf<VersionedCommittedBlock>);
-
-    impl Display for ParentHashNotFound {
-        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-            write!(f, "Block with parent hash {} not found", self.0)
-        }
-    }
-
-    impl StdError for ParentHashNotFound {}
 }
 
-impl<W: WorldTrait> Execute<W> for Instruction {
+impl Execute for Instruction {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         use Instruction::*;
         match self {
@@ -296,13 +242,14 @@ impl<W: WorldTrait> Execute<W> for Instruction {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for RegisterBox {
+impl Execute for RegisterBox {
     type Error = Error;
 
-    fn execute(self, authority: AccountId, wsv: &WorldStateView<W>) -> Result<(), Self::Error> {
+    fn execute(self, authority: AccountId, wsv: &WorldStateView) -> Result<(), Self::Error> {
         let context = Context::new();
-
-        match self.object.evaluate(wsv, &context)? {
+        let object_id = self.object.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?object_id);
+        match object_id {
             RegistrableBox::Peer(peer) => Register::<Peer>::new(*peer).execute(authority, wsv),
             RegistrableBox::Domain(domain) => {
                 Register::<Domain>::new(*domain).execute(authority, wsv)
@@ -313,24 +260,27 @@ impl<W: WorldTrait> Execute<W> for RegisterBox {
             RegistrableBox::AssetDefinition(asset_definition) => {
                 Register::<AssetDefinition>::new(*asset_definition).execute(authority, wsv)
             }
+            RegistrableBox::Asset(asset) => Register::<Asset>::new(*asset).execute(authority, wsv),
             RegistrableBox::Trigger(trigger) => {
                 Register::<Trigger<FilterBox>>::new(*trigger).execute(authority, wsv)
             }
             RegistrableBox::Role(role) => Register::<Role>::new(*role).execute(authority, wsv),
-            _ => Err(Error::Unsupported(InstructionType::Register)),
         }
     }
 }
 
-impl<W: WorldTrait> Execute<W> for UnregisterBox {
+impl Execute for UnregisterBox {
     type Error = Error;
 
-    fn execute(self, authority: AccountId, wsv: &WorldStateView<W>) -> Result<(), Self::Error> {
+    fn execute(self, authority: AccountId, wsv: &WorldStateView) -> Result<(), Self::Error> {
         let context = Context::new();
-        match self.object_id.evaluate(wsv, &context)? {
+        let object_id = self.object_id.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?object_id, %authority);
+        match object_id {
             IdBox::AccountId(account_id) => {
                 Unregister::<Account>::new(account_id).execute(authority, wsv)
             }
+            IdBox::AssetId(asset_id) => Unregister::<Asset>::new(asset_id).execute(authority, wsv),
             IdBox::AssetDefinitionId(asset_definition_id) => {
                 Unregister::<AssetDefinition>::new(asset_definition_id).execute(authority, wsv)
             }
@@ -338,24 +288,27 @@ impl<W: WorldTrait> Execute<W> for UnregisterBox {
                 Unregister::<Domain>::new(domain_id).execute(authority, wsv)
             }
             IdBox::PeerId(peer_id) => Unregister::<Peer>::new(peer_id).execute(authority, wsv),
-            _ => Err(Error::Unsupported(InstructionType::Unregister)),
+            IdBox::RoleId(role_id) => Unregister::<Role>::new(role_id).execute(authority, wsv),
+            IdBox::TriggerId(trigger_id) => {
+                Unregister::<Trigger<FilterBox>>::new(trigger_id).execute(authority, wsv)
+            }
         }
     }
 }
 
-impl<W: WorldTrait> Execute<W> for MintBox {
+impl Execute for MintBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
-        match (
-            self.destination_id.evaluate(wsv, &context)?,
-            self.object.evaluate(wsv, &context)?,
-        ) {
+        let destination_id = self.destination_id.evaluate(wsv, &context)?;
+        let object = self.object.evaluate(wsv, &context)?;
+        iroha_logger::trace!(%destination_id, ?object, %authority);
+        match (destination_id, object) {
             (IdBox::AssetId(asset_id), Value::U32(quantity)) => {
                 Mint::<Asset, u32>::new(quantity, asset_id).execute(authority, wsv)
             }
@@ -380,15 +333,18 @@ impl<W: WorldTrait> Execute<W> for MintBox {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for BurnBox {
+impl Execute for BurnBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
+        let destination_id = self.destination_id.evaluate(wsv, &context)?;
+        let object = self.object.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?destination_id, ?object, %authority);
         match (
             self.destination_id.evaluate(wsv, &context)?,
             self.object.evaluate(wsv, &context)?,
@@ -396,39 +352,51 @@ impl<W: WorldTrait> Execute<W> for BurnBox {
             (IdBox::AssetId(asset_id), Value::U32(quantity)) => {
                 Burn::<Asset, u32>::new(quantity, asset_id).execute(authority, wsv)
             }
+            (IdBox::AssetId(asset_id), Value::U128(quantity)) => {
+                Burn::new(quantity, asset_id).execute(authority, wsv)
+            }
             (IdBox::AssetId(asset_id), Value::Fixed(quantity)) => {
-                Burn::<Asset, Fixed>::new(quantity, asset_id).execute(authority, wsv)
+                Burn::new(quantity, asset_id).execute(authority, wsv)
             }
             (IdBox::AccountId(account_id), Value::PublicKey(public_key)) => {
-                Burn::<Account, PublicKey>::new(public_key, account_id).execute(authority, wsv)
+                Burn::new(public_key, account_id).execute(authority, wsv)
             }
+            // Not implemented yet.
+            // (IdBox::AccountId(account_id), Value::SignatureCheckCondition(condition)) => {
+            //     Burn::<Account, SignatureCheckCondition>::new(condition, account_id).execute(authority, wsv)
+            // }
             _ => Err(Error::Unsupported(InstructionType::Burn)),
         }
     }
 }
 
-impl<W: WorldTrait> Execute<W> for TransferBox {
+impl Execute for TransferBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
-        let source_asset_id = match self.source_id.evaluate(wsv, &context)? {
-            IdBox::AssetId(source_asset_id) => source_asset_id,
+        let (source_asset_id, destination_asset_id) = match (
+            self.source_id.evaluate(wsv, &context)?,
+            self.destination_id.evaluate(wsv, &context)?,
+        ) {
+            (IdBox::AssetId(src), IdBox::AssetId(dst)) => (src, dst),
             _ => return Err(Error::Unsupported(InstructionType::Transfer)),
         };
 
-        let quantity = match self.object.evaluate(wsv, &context)? {
-            Value::U32(quantity) => quantity,
-            _ => return Err(Error::Unsupported(InstructionType::Transfer)),
-        };
+        let value = self.object.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?source_asset_id, ?destination_asset_id, ?value, %authority);
 
-        match self.destination_id.evaluate(wsv, &context)? {
-            IdBox::AssetId(destination_asset_id) => {
-                Transfer::<Asset, u32, Asset>::new(source_asset_id, quantity, destination_asset_id)
+        match value {
+            Value::U32(quantity) => Transfer::new(source_asset_id, quantity, destination_asset_id)
+                .execute(authority, wsv),
+            Value::U128(quantity) => Transfer::new(source_asset_id, quantity, destination_asset_id)
+                .execute(authority, wsv),
+            Value::Fixed(quantity) => {
+                Transfer::new(source_asset_id, quantity, destination_asset_id)
                     .execute(authority, wsv)
             }
             _ => Err(Error::Unsupported(InstructionType::Transfer)),
@@ -436,17 +404,18 @@ impl<W: WorldTrait> Execute<W> for TransferBox {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for SetKeyValueBox {
+impl Execute for SetKeyValueBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
         let key = self.key.evaluate(wsv, &context)?;
         let value = self.value.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?key, ?value, %authority);
         match self.object_id.evaluate(wsv, &context)? {
             IdBox::AssetId(asset_id) => {
                 SetKeyValue::<Asset, Name, Value>::new(asset_id, key, value).execute(authority, wsv)
@@ -467,16 +436,17 @@ impl<W: WorldTrait> Execute<W> for SetKeyValueBox {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for RemoveKeyValueBox {
+impl Execute for RemoveKeyValueBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
         let key = self.key.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?key, %authority);
         match self.object_id.evaluate(wsv, &context)? {
             IdBox::AssetId(asset_id) => {
                 RemoveKeyValue::<Asset, Name>::new(asset_id, key).execute(authority, wsv)
@@ -493,47 +463,51 @@ impl<W: WorldTrait> Execute<W> for RemoveKeyValueBox {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for If {
+impl Execute for If {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
+        iroha_logger::trace!(?self);
         if self.condition.evaluate(wsv, &context)? {
             self.then.execute(authority, wsv)?;
         } else if let Some(otherwise) = self.otherwise {
             otherwise.execute(authority, wsv)?;
         }
-
         Ok(())
     }
 }
 
-impl<W: WorldTrait> Execute<W> for Pair {
+impl Execute for Pair {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
+        iroha_logger::trace!(?self);
+
         self.left_instruction.execute(authority.clone(), wsv)?;
         self.right_instruction.execute(authority, wsv)?;
         Ok(())
     }
 }
 
-impl<W: WorldTrait> Execute<W> for SequenceBox {
+impl Execute for SequenceBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
+        iroha_logger::trace!(?self);
+
         for instruction in self.instructions {
             instruction.execute(authority.clone(), wsv)?;
         }
@@ -541,31 +515,33 @@ impl<W: WorldTrait> Execute<W> for SequenceBox {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for FailBox {
+impl Execute for FailBox {
     type Error = Error;
 
     fn execute(
         self,
         _authority: <Account as Identifiable>::Id,
-        _wsv: &WorldStateView<W>,
+        _wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
+        iroha_logger::trace!(?self);
+
         Err(Error::FailBox(self.message))
     }
 }
 
-impl<W: WorldTrait> Execute<W> for GrantBox {
+impl Execute for GrantBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
-        match (
-            self.destination_id.evaluate(wsv, &context)?,
-            self.object.evaluate(wsv, &context)?,
-        ) {
+        let destination_id = self.destination_id.evaluate(wsv, &context)?;
+        let object = self.object.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?destination_id, ?object, %authority);
+        match (destination_id, object) {
             (IdBox::AccountId(account_id), Value::PermissionToken(permission_token)) => {
                 Grant::<Account, PermissionToken>::new(permission_token, account_id)
                     .execute(authority, wsv)
@@ -578,19 +554,19 @@ impl<W: WorldTrait> Execute<W> for GrantBox {
     }
 }
 
-impl<W: WorldTrait> Execute<W> for RevokeBox {
+impl Execute for RevokeBox {
     type Error = Error;
 
     fn execute(
         self,
         authority: <Account as Identifiable>::Id,
-        wsv: &WorldStateView<W>,
+        wsv: &WorldStateView,
     ) -> Result<(), Self::Error> {
         let context = Context::new();
-        match (
-            self.destination_id.evaluate(wsv, &context)?,
-            self.object.evaluate(wsv, &context)?,
-        ) {
+        let destination_id = self.destination_id.evaluate(wsv, &context)?;
+        let object = self.object.evaluate(wsv, &context)?;
+        iroha_logger::trace!(?destination_id, ?object, %authority);
+        match (destination_id, object) {
             (IdBox::AccountId(account_id), Value::PermissionToken(permission_token)) => {
                 Revoke::<Account, PermissionToken>::new(permission_token, account_id)
                     .execute(authority, wsv)
@@ -604,8 +580,8 @@ impl<W: WorldTrait> Execute<W> for RevokeBox {
 }
 
 pub mod prelude {
-    //! Re-exports important traits and types. Meant to be glob imported when using `Iroha`.
-    pub use super::{account::isi::*, asset::isi::*, domain::isi::*, world::isi::*, *};
+    //! Re-export important traits and types for glob import `(::*)`
+    pub use super::*;
 }
 
 #[cfg(test)]
@@ -637,7 +613,7 @@ mod tests {
 
     #[test]
     fn asset_store() -> Result<()> {
-        let wsv = WorldStateView::<World>::new(world_with_test_domains()?);
+        let wsv = WorldStateView::new(world_with_test_domains()?);
         let account_id = AccountId::from_str("alice@wonderland")?;
         let asset_definition_id = AssetDefinitionId::from_str("rose#wonderland")?;
         let asset_id = AssetId::new(asset_definition_id, account_id.clone());

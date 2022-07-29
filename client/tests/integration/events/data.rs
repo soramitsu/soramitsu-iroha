@@ -6,7 +6,7 @@ use eyre::Result;
 use iroha_core::smartcontracts::wasm;
 use iroha_data_model::{prelude::*, transaction::WasmSmartContract};
 use parity_scale_codec::Encode;
-use test_network::{Peer as TestPeer, *};
+use test_network::*;
 
 use super::Configuration;
 use crate::wasm::utils::wasm_template;
@@ -94,13 +94,13 @@ fn wasm_execution_should_produce_events() -> Result<()> {
 }
 
 fn transaction_execution_should_produce_events(executable: Executable) -> Result<()> {
-    let (_rt, _peer, client) = <TestPeer>::start_test_with_runtime();
+    let (_rt, _peer, client) = <PeerBuilder>::new().start_with_runtime();
     wait_for_genesis_committed(&vec![client.clone()], 0);
 
     let pipeline_time = Configuration::pipeline_time();
 
     // spawn event reporter
-    let mut listener = client.clone();
+    let listener = client.clone();
     let (init_sender, init_receiver) = mpsc::channel();
     let (event_sender, event_receiver) = mpsc::channel();
     let event_filter = DataEventFilter::AcceptAll.into();

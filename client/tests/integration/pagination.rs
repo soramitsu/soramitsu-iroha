@@ -4,13 +4,13 @@ use std::thread;
 
 use iroha_client::client::asset;
 use iroha_data_model::prelude::*;
-use test_network::{Peer as TestPeer, *};
+use test_network::*;
 
 use super::Configuration;
 
 #[test]
 fn client_add_asset_quantity_to_existing_asset_should_increase_asset_amount() {
-    let (_rt, _peer, mut iroha_client) = <TestPeer>::start_test_with_runtime();
+    let (_rt, _peer, iroha_client) = <PeerBuilder>::new().start_with_runtime();
     wait_for_genesis_committed(&vec![iroha_client.clone()], 0);
     let pipeline_time = Configuration::pipeline_time();
 
@@ -18,9 +18,9 @@ fn client_add_asset_quantity_to_existing_asset_should_increase_asset_amount() {
         .map(|c| c.to_string())
         .map(|name| (name + "#wonderland").parse().expect("Valid"))
         .map(|asset_definition_id| {
-            Instruction::Register(RegisterBox::new(
-                AssetDefinition::quantity(asset_definition_id).build(),
-            ))
+            Instruction::Register(RegisterBox::new(AssetDefinition::quantity(
+                asset_definition_id,
+            )))
         })
         .collect();
     iroha_client

@@ -61,20 +61,35 @@ pub trait Txn {
     ///
     /// Fails if number of instructions or wasm size exceeds maximum
     #[inline]
+    #[allow(clippy::expect_used)]
     fn check_limits(&self, limits: &TransactionLimits) -> Result<(), TransactionLimitError> {
         match &self.payload().instructions {
             Executable::Instructions(instructions) => {
-                let instruction_count: usize = instructions.iter().map(Instruction::len).sum();
+                let instruction_count: u64 = instructions
+                    .iter()
+                    .map(Instruction::len)
+                    .sum::<usize>()
+                    .try_into()
+                    .expect("`usize` should always fit in `u64`");
 
-                if instruction_count as u64 > limits.max_instruction_number {
-                    return Err(TransactionLimitError(String::from(
-                        "Too many instructions in payload",
+                if instruction_count > limits.max_instruction_number {
+                    return Err(TransactionLimitError(format!(
+                        "Too many instructions in payload, max number is {}, but got {}",
+                        limits.max_instruction_number, instruction_count
                     )));
                 }
             }
             Executable::Wasm(WasmSmartContract { raw_data }) => {
-                if raw_data.len() as u64 > limits.max_wasm_size_bytes {
-                    return Err(TransactionLimitError(String::from("wasm binary too large")));
+                let len: u64 = raw_data
+                    .len()
+                    .try_into()
+                    .expect("`usize` should always fit in `u64`");
+
+                if len > limits.max_wasm_size_bytes {
+                    return Err(TransactionLimitError(format!(
+                        "Wasm binary too large, max size is {}, but got {}",
+                        limits.max_wasm_size_bytes, len
+                    )));
                 }
             }
         }
@@ -424,7 +439,7 @@ impl PartialOrd for TransactionValue {
     }
 }
 
-declare_versioned_with_scale!(VersionedValidTransaction 1..2, Debug, Clone, FromVariant, IntoSchema);
+declare_versioned!(VersionedValidTransaction 1..2, Debug, Clone, PartialEq, Eq, FromVariant, IntoSchema);
 
 impl VersionedValidTransaction {
     /// Converts from `&VersionedValidTransaction` to V1 reference
@@ -463,7 +478,7 @@ impl Txn for VersionedValidTransaction {
 
 /// `ValidTransaction` represents trustfull Transaction state.
 #[version_with_scale(n = 1, versioned = "VersionedValidTransaction")]
-#[derive(Debug, Clone, Decode, Encode, IntoSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Decode, Encode, Deserialize, Serialize, IntoSchema)]
 pub struct ValidTransaction {
     /// The [`Transaction`]'s payload.
     pub payload: Payload,

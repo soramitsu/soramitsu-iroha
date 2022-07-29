@@ -1,7 +1,7 @@
 //! Events for streaming API.
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec::Vec};
 
 use iroha_macro::FromVariant;
 use iroha_schema::prelude::*;
@@ -88,7 +88,9 @@ pub enum EventSubscriberMessage {
 }
 
 /// Event.
-#[derive(Debug, Clone, PartialEq, Eq, Decode, Encode, FromVariant, IntoSchema)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Decode, Encode, Deserialize, Serialize, FromVariant, IntoSchema,
+)]
 pub enum Event {
     /// Pipeline event.
     Pipeline(pipeline::Event),

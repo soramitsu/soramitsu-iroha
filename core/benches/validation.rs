@@ -7,7 +7,7 @@ use iroha_core::{
     prelude::*,
     sumeragi::view_change,
     tx::{AcceptedTransaction, TransactionValidator},
-    wsv::{World, WorldTrait},
+    wsv::World,
 };
 use iroha_data_model::prelude::*;
 
@@ -40,7 +40,7 @@ fn build_test_transaction(keys: KeyPair) -> Transaction {
         "xor".parse().expect("Valid"),
         domain_name.parse().expect("Valid"),
     );
-    let create_asset = RegisterBox::new(AssetDefinition::quantity(asset_definition_id).build());
+    let create_asset = RegisterBox::new(AssetDefinition::quantity(asset_definition_id));
     let instructions: Vec<Instruction> = vec![
         create_domain.into(),
         create_account.into(),
@@ -58,7 +58,7 @@ fn build_test_transaction(keys: KeyPair) -> Transaction {
     .expect("Failed to sign.")
 }
 
-fn build_test_wsv(keys: KeyPair) -> WorldStateView<World> {
+fn build_test_wsv(keys: KeyPair) -> WorldStateView {
     let (public_key, _) = keys.into();
 
     WorldStateView::new({

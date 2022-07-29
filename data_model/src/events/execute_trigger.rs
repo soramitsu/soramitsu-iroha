@@ -3,8 +3,8 @@
 use super::*;
 use crate::prelude::*;
 
-/// Trigger execution event. Produced every time [`ExecuteTrigger`] instruction is executed
-#[derive(Debug, Clone, PartialEq, Eq, Decode, Encode, IntoSchema)]
+/// Trigger execution event. Produced every time the `ExecuteTrigger` instruction is executed.
+#[derive(Debug, Clone, PartialEq, Eq, Decode, Encode, Serialize, Deserialize, IntoSchema)]
 pub struct Event {
     /// Id of trigger to be executed
     trigger_id: TriggerId,
