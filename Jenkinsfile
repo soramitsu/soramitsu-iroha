@@ -14,4 +14,3 @@ def pipeline = new org.iroha2PRDeploy.AppPipeline(steps: this,
     disableSecretScanner: true
 )
 pipeline.runPipeline()
-
