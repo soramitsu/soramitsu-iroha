@@ -9,8 +9,8 @@ def pipeline = new org.iroha2PRDeploy.AppPipeline(steps: this,
     devValuesPath: "dev/dev/",
     initialSecretName: "iroha2-eso-base",
     initialNameSpace: "iroha2-dev",
-    targetNameSpace: "iroha2-${env.CHANGE_ID}-dev",
-    targetSecretName: "iroha2-${env.CHANGE_ID}-dev-eso-base",
+    targetNameSpace: "iroha2-dev-${env.CHANGE_ID}-web",
+    targetSecretName: "iroha2-dev-${env.CHANGE_ID}-web-eso-base",
     disableSecretScanner: true
 )
 pipeline.runPipeline()
